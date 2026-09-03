@@ -1,0 +1,9 @@
+# Python 3.12. Install the CUDA build of torch/torchvision as shown in README first.
+torch==2.11.0
+torchvision==0.26.0
+clip @ git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6
+Pillow>=11.0,<13
+PyYAML==6.0.3
+tqdm>=4.66,<5
+pytest==9.1.1
+

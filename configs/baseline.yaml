@@ -1,0 +1,23 @@
+seed: 42
+
+experiment:
+  name: frozen_clip_linear_baseline
+
+data:
+  train_dir: data/train
+  test_dir: data/test
+  split_manifest: manifests/train_val_split.json
+  val_ratio: 0.10
+
+model:
+  name: ViT-B/32
+  download_root: models
+
+training:
+  batch_size: 128
+  num_workers: 4
+  epochs: 10
+  learning_rate: 0.001
+  weight_decay: 0.01
+  amp: true
+  device: cuda

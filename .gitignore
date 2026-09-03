@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and editors
+.venv*/
+venv/
+.idea/
+.vscode/
+
+# Competition data and model artifacts
+data/
+models/
+outputs/
+tmp/
+*.pt
+*.pth
+*.ckpt
+pred_results.csv
+!submission/pred_results.csv
+
+# Experiment outputs (keep the directory itself)
+runs/*
+!runs/.gitkeep
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local Test
+tests/
