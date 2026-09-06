@@ -1,0 +1,19 @@
+# 数据 / memmap / checkpoint / 产物（本目录自包含，不进入 Git）
+cache/
+outputs/
+train_orig/
+test/
+data/
+models/
+runs/
+*.pt
+*.npy
+*.zip
+*.tgz
+*.tar
+*.csv
+*.pdf
+__pycache__/
+*.pyc
+.idea/
+.vscode/

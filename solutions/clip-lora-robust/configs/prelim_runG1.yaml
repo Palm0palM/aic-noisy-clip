@@ -1,0 +1,53 @@
+# Run G1：冠军配方(352real run2) + 自蒸馏重打标（唯一变量）
+# 重打标来源: 冠军模型(outputs/prelim_run2_352real/best.pt, EMA) TTA logits
+#   温度 T=3 + 先验均衡校正 tau=1，置信度>0.8 且与给定标签分歧 -> 覆盖标签 (5585 个)
+# 选模: select_metric=acc，此时 val 标签同样被精化，更贴近干净测试集
+seed: 42
+
+data:
+  train_dir: "train_orig"
+  test_dir: "test"
+  num_classes: 500
+  val_ratio: 0.05
+  num_workers: 6
+  index_cache: "cache/train_index_256.csv"
+  bad_list: "cache/bad_images.json"
+  train_mm: "cache/train_u8_352.npy"
+  test_mm: "cache/test_u8_352.npy"
+  test_names: "cache/test_names.json"
+  mm_size: 352
+  relabel_file: "relabel_t3_tau1_thr08.csv"
+
+model:
+  clip_name: "cache/clip-vit-base-patch32"
+  img_size: 352
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  lora_targets: ["q_proj", "v_proj"]
+  train_ln: true
+  logit_scale_init: 3.2188758248682006
+
+train:
+  epochs: 20
+  warmup_epochs: 3
+  batch_size: 160
+  eval_batch_size: 192
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  min_lr_ratio: 0.01
+  drift_lambda: 0.5
+  ema_decay: 0.999
+  loss_mode: "run2"
+  pseudo_conf_thr: 0.75
+  clean_prob_thr: 0.6
+  gce_q: 0.7
+  gmm_every: 2
+  select_metric: "acc"
+  amp: true
+  out_dir: "outputs/prelim_runG1"
+
+infer:
+  batch_size: 384
+  out_csv: "outputs/prelim_runG1/pred_results.csv"

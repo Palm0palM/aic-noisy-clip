@@ -1,0 +1,49 @@
+# run B 服务器版（RTX 4090D 24GB / 18 vCPU / 60GB RAM）
+# 全部相对路径：cd 到 AIC 目录后运行；先执行 python fix_index_paths.py 重写索引路径
+# 与本地 prelim_r4_352.yaml 的唯一差异：路径相对化 + batch/workers 按服务器资源放大
+seed: 42
+
+data:
+  train_dir: "cache/train_256"
+  test_dir: "test"
+  num_classes: 500
+  val_ratio: 0.05
+  num_workers: 12
+  index_cache: "cache/train_index_256.csv"
+  bad_list: "cache/bad_images.json"
+  train_mm: "cache/train_u8_352.npy"
+  test_mm: "cache/test_u8_352.npy"
+  test_names: "cache/test_names.json"
+  mm_size: 352
+
+model:
+  clip_name: "cache/clip-vit-base-patch32"
+  img_size: 352                       # pos-embed 7x7 -> 11x11 插值
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  lora_targets: ["q_proj", "v_proj"]  # 与 run A 完全一致才能接力
+  train_ln: true
+  logit_scale_init: 3.2188758248682006
+
+train:
+  epochs: 12
+  warmup_epochs: 0                    # 接力微调，直接 GMM 精化 + mixup
+  batch_size: 160                     # 24GB 显存（本地 8GB 为 64）
+  eval_batch_size: 384
+  lr: 2.0e-4                          # 接力阶段保守 lr，不随 batch 放大
+  weight_decay: 1.0e-4
+  warmup_steps: 200
+  min_lr_ratio: 0.01
+  drift_lambda: 0.3                   # 参考特征为接力初始模型(352)特征
+  ema_decay: 0.999
+  gce_q: 0.7
+  gmm_every: 2
+  select_metric: "acc"              # 按原始 val acc 选 best.pt（cln 循环论证已弃用，见 r5）
+  zs_alpha: 0.25                      # 此处先验为 run A 模型预测（自蒸馏）
+  amp: true
+  out_dir: "outputs/prelim_r4_352"
+
+infer:
+  batch_size: 384
+  out_csv: "outputs/prelim_r4_352/pred_results.csv"

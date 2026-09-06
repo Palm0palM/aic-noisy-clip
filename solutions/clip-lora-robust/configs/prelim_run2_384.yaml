@@ -1,0 +1,50 @@
+# Run G2：384px 从零训练（冠军配方，原始标签——重打标已实测 -1.06 止损）
+# 唯一变量 vs 冠军: 分辨率 352 -> 384（tokens 122 -> 145），batch/eval 相应缩小
+seed: 42
+
+data:
+  train_dir: "train_orig"
+  test_dir: "test"
+  num_classes: 500
+  val_ratio: 0.05
+  num_workers: 6
+  index_cache: "cache/train_index_256.csv"
+  bad_list: "cache/bad_images.json"
+  train_mm: "cache/train_u8_384.npy"
+  test_mm: "cache/test_u8_384.npy"
+  test_names: "cache/test_names.json"
+  mm_size: 384
+
+model:
+  clip_name: "cache/clip-vit-base-patch32"
+  img_size: 384
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  lora_targets: ["q_proj", "v_proj"]
+  train_ln: true
+  logit_scale_init: 3.2188758248682006
+
+train:
+  epochs: 20
+  warmup_epochs: 3
+  batch_size: 112
+  eval_batch_size: 128
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  min_lr_ratio: 0.01
+  drift_lambda: 0.5
+  ema_decay: 0.999
+  loss_mode: "run2"
+  pseudo_conf_thr: 0.75
+  clean_prob_thr: 0.6
+  gce_q: 0.7
+  gmm_every: 2
+  select_metric: "acc"
+  amp: true
+  out_dir: "outputs/prelim_run2_384"
+
+infer:
+  batch_size: 288
+  out_csv: "outputs/prelim_run2_384/pred_results.csv"
