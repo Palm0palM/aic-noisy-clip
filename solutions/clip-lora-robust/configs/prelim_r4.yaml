@@ -1,0 +1,46 @@
+# run A (r4)：224px 恢复训练 —— run2 验证配方 + 零样本先验精化 + 干净子集选模
+seed: 42
+
+data:
+  train_dir: "D:/AIC/cache/train_256"
+  test_dir: "D:/download/test"
+  num_classes: 500
+  val_ratio: 0.05
+  num_workers: 6
+  index_cache: "cache/train_index_256.csv"
+  bad_list: "cache/bad_images.json"
+  train_mm: "cache/train_u8_256.npy"
+  test_mm: "cache/test_u8_256.npy"
+  test_names: "cache/test_names.json"
+
+model:
+  clip_name: "D:/AIC/cache/clip-vit-base-patch32"
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  lora_targets: ["q_proj", "v_proj"]   # run2 验证最有效的注入组合
+  train_ln: true
+  logit_scale_init: 3.2188758248682006  # ln(25)
+
+train:
+  epochs: 20
+  warmup_epochs: 3
+  batch_size: 160
+  eval_batch_size: 384
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  min_lr_ratio: 0.01
+  drift_lambda: 0.5
+  ema_decay: 0.999
+  pseudo_conf_thr: 0.75
+  clean_prob_thr: 0.6
+  gce_q: 0.7
+  gmm_every: 2
+  zs_alpha: 0.25              # 标签精化中混入零样本先验的比例，抑制系统性噪声
+  amp: true
+  out_dir: "outputs/prelim_r4"
+
+infer:
+  batch_size: 512
+  out_csv: "outputs/prelim_r4/pred_results.csv"

@@ -1,0 +1,45 @@
+# 初赛配置：500 类，均衡数据，含噪标签
+seed: 42
+
+data:
+  train_dir: "D:/AIC/cache/train_256"   # 预处理缓存(SSD)，由 prepare_cache.py 从 F: 生成
+  test_dir: "D:/download/test"
+  num_classes: 500
+  val_ratio: 0.05
+  num_workers: 6
+  index_cache: "cache/train_index_256.csv"
+  bad_list: "cache/bad_images.json"
+  train_mm: "cache/train_u8_256.npy"      # prepare_memmap.py 产物
+  test_mm: "cache/test_u8_256.npy"
+  test_names: "cache/test_names.json"
+
+model:
+  clip_name: "D:/AIC/cache/clip-vit-base-patch32"  # 本地权重(openai官方,经hf-mirror下载)
+  lora_rank: 16
+  lora_alpha: 32.0
+  lora_dropout: 0.05
+  lora_targets: ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]  # 全层注入
+  train_ln: true
+  logit_scale_init: 3.2188758248682006  # ln(25)
+
+train:
+  epochs: 25
+  warmup_epochs: 3          # warm-up 阶段用 GCE 在全部数据上训练
+  batch_size: 160
+  eval_batch_size: 384
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  min_lr_ratio: 0.01
+  drift_lambda: 0.5         # 特征漂移约束初始权重，随训练线性衰减到 0.1 倍
+  ema_decay: 0.999
+  pseudo_conf_thr: 0.75     # 教师置信度阈值，低于该值的噪声样本改用 GCE 降权弱监督
+  clean_prob_thr: 0.6       # GMM 干净后验概率阈值（保守，减少误删干净样本）
+  gce_q: 0.7
+  gmm_every: 2              # warm-up 后每隔多少个 epoch 重新划分干净/噪声
+  amp: true                 # bf16 混合精度
+  out_dir: "outputs/prelim"
+
+infer:
+  batch_size: 512
+  out_csv: "outputs/prelim/pred_results.csv"

@@ -1,1 +1,2 @@
 submission_id,created_at,created_by,source_run_id,source_prediction_path,candidate_path,sha256,row_count,status,selected_at,score,rank,scored_at,notes
+20260906_173304_654298_5146c181,2026-09-06T17:33:04+08:00,trae,clip-lora-robust-5view-TTA,runs/clip-lora-robust/pred_results.csv,candidates/candidate_20260906_173304_654298_clip-lora-robust-5view-TTA_5146c181.csv,5146c1814ac66e247b5f5e5cd1176661c8beecbb89601f4e18bef50288247a73,24967,candidate,,,,,"CLIP ViT-B/32 LoRA + GMM/EMA 噪声鲁棒自训练(352px) + 5尺度TTA(0.3/0.3/0.1/0.1/0.2, T=5, tau=1.4)；平台实测 73.9216，初赛最高"

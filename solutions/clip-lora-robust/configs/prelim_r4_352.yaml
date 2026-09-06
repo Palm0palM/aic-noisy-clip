@@ -1,0 +1,48 @@
+# run B (r4_352)：352px 接力微调 —— init from run A last.pt（LoRA 结构须与 run A 一致）
+# 注意：勿用 run A best.pt —— 它是 epoch 0 EMA（cln 循环论证选出，raw acc 仅 0.5938）
+seed: 42
+
+data:
+  train_dir: "D:/AIC/cache/train_256"
+  test_dir: "D:/download/test"
+  num_classes: 500
+  val_ratio: 0.05
+  num_workers: 6
+  index_cache: "cache/train_index_256.csv"
+  bad_list: "cache/bad_images.json"
+  train_mm: "cache/train_u8_352.npy"
+  test_mm: "cache/test_u8_352.npy"
+  test_names: "cache/test_names.json"
+  mm_size: 352
+
+model:
+  clip_name: "D:/AIC/cache/clip-vit-base-patch32"
+  img_size: 352                       # pos-embed 7x7 -> 11x11 插值
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  lora_targets: ["q_proj", "v_proj"]  # 与 run A 完全一致才能接力
+  train_ln: true
+  logit_scale_init: 3.2188758248682006
+
+train:
+  epochs: 12
+  warmup_epochs: 0                    # 接力微调，直接 GMM 精化 + mixup
+  batch_size: 64                      # 352px 显存约束
+  eval_batch_size: 128
+  lr: 2.0e-4                          # 接力阶段 lr 减半
+  weight_decay: 1.0e-4
+  warmup_steps: 200
+  min_lr_ratio: 0.01
+  drift_lambda: 0.3                   # 参考特征为接力初始模型(352)特征
+  ema_decay: 0.999
+  gce_q: 0.7
+  gmm_every: 2
+  select_metric: "acc"              # 按原始 val acc 选 best.pt（cln 循环论证已弃用，见 r5）
+  zs_alpha: 0.25                      # 此处先验为 run A 模型预测（自蒸馏）
+  amp: true
+  out_dir: "outputs/prelim_r4_352"
+
+infer:
+  batch_size: 128
+  out_csv: "outputs/prelim_r4_352/pred_results.csv"

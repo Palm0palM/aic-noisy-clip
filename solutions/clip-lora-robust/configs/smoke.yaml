@@ -1,0 +1,45 @@
+# 冒烟测试配置：小数据量验证全流程
+seed: 42
+
+data:
+  train_dir: "D:/AIC/cache/train_256"
+  test_dir: "D:/download/test"
+  num_classes: 500
+  val_ratio: 0.1
+  max_per_class: 20          # 每类仅 20 张，快速跑通
+  num_workers: 4
+  index_cache: "cache/train_index_256.csv"
+  bad_list: "cache/bad_images.json"
+  train_mm: "cache/train_u8_256.npy"
+  test_mm: "cache/test_u8_256.npy"
+  test_names: "cache/test_names.json"
+
+model:
+  clip_name: "D:/AIC/cache/clip-vit-base-patch32"
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  lora_targets: ["q_proj", "v_proj"]
+  train_ln: true
+  logit_scale_init: 3.2188758248682006
+
+train:
+  epochs: 3
+  warmup_epochs: 1
+  batch_size: 128
+  eval_batch_size: 256
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 20
+  min_lr_ratio: 0.01
+  drift_lambda: 0.5
+  ema_decay: 0.99
+  pseudo_conf_thr: 0.6
+  gce_q: 0.7
+  gmm_every: 1
+  amp: true
+  out_dir: "outputs/smoke"
+
+infer:
+  batch_size: 256
+  out_csv: "outputs/smoke/pred_results.csv"
