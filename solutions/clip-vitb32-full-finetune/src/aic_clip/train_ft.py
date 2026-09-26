@@ -371,6 +371,8 @@ def main():
     parser.add_argument("--init-weights", default="auto", choices=["auto", "raw", "ema"])
     parser.add_argument("--train-on-all", action="store_true",
                         help="train on the full manifest (train+holdout); holdout metrics then become in-sample and are only logged")
+    parser.add_argument("--drop-indices", default="", help="npy with manifest positions to exclude from training")
+    parser.add_argument("--snapshot-dir", default="", help="if set, save the raw weights after every epoch (for SWA)")
     parser.add_argument("--image-size", type=int, default=0, help="override config image size")
     parser.add_argument("--epochs", type=int, default=0, help="override config epochs")
     parser.add_argument("--tag", default="", help="suffix appended to output dir")
@@ -405,6 +407,14 @@ def main():
     if args.train_on_all:
         print(f"[data] train_on_all: using {len(records)} samples (holdout metrics are in-sample)", flush=True)
         train_idx = list(range(len(records)))
+    if args.drop_indices:
+        drop = {int(x) for x in np.load(args.drop_indices)}
+        before = len(train_idx)
+        train_idx = [i for i in train_idx if i not in drop]
+        print(f"[data] drop_indices: removed {before - len(train_idx)} samples "
+              f"(keep {len(train_idx)})", flush=True)
+    if args.snapshot_dir:
+        Path(args.snapshot_dir).mkdir(parents=True, exist_ok=True)
 
     image_size = int(cfg["data"]["image_size"])
     eval_size = int(cfg["data"]["eval_size"])
@@ -606,6 +616,13 @@ def main():
             "backbone": cfg["model"]["backbone"],
         }
         torch.save(payload, out_dir / "last.pt")
+        if args.snapshot_dir:
+            torch.save(
+                {"model": raw_state, "epoch": epoch, "config": cfg,
+                 "image_size": image_size, "eval_size": eval_size,
+                 "num_classes": num_classes, "backbone": cfg["model"]["backbone"]},
+                Path(args.snapshot_dir) / f"epoch{epoch:02d}.pt",
+            )
         if score > best_score:
             best_score = score
             torch.save(payload, out_dir / "best.pt")
