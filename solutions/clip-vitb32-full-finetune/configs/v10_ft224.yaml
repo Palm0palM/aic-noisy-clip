@@ -1,0 +1,62 @@
+# V10-A: full fine-tuning of the official CLIP ViT-B/32 (no LoRA, no frozen blocks)
+# Single model / single inference flow. Train split only — test images and test labels
+# are never touched by this recipe.
+seed: 20260926
+
+paths:
+  project_root: /root/autodl-tmp/projects/AIC-Robust-CLIP-复赛
+
+data:
+  # train_cache288 = deterministic short-side<=288 re-encode of the official
+  # training images (scripts/build_image_cache.py). Same pixels, ~20x cheaper decode.
+  train_dir: /root/autodl-tmp/data/aic-rematch/train_cache288
+  manifest: artifacts/train_manifest.csv
+  split: artifacts/split_seed20260921.json
+  num_classes: 750
+  expected_train_images: 148643
+  image_size: 224
+  eval_size: 224
+  eval_resize_ratio: 1.14
+  batch_size: 256
+  val_batch_size: 384
+  num_workers: 12
+  prefetch_factor: 4
+
+model:
+  backbone: openai/clip-vit-base-patch32
+  revision: c237dc49a33fc61debc9276459120b7eac67e7ef
+  head: linear
+  dropout: 0.0
+  freeze_patch_embed: false
+
+augment:
+  rrc_scale: [0.40, 1.0]
+  color_jitter: 0.4
+  rand_augment: true
+  rand_augment_ops: 2
+  rand_augment_magnitude: 7
+  random_erase: 0.25
+  mixup: 0.2
+  cutmix: 1.0
+  mix_prob: 0.5
+  label_smoothing: 0.1
+
+sampler:
+  scheme: sqrt_inv
+  power: 0.5
+
+train:
+  epochs: 15
+  lr_backbone: 3.0e-5
+  lr_head: 5.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 1.5
+  min_lr_ratio: 0.02
+  grad_clip: 1.0
+  ema_decay: 0.9995
+  amp_dtype: bfloat16
+  elr_lambda: 0.0
+  elr_momentum: 0.9
+  early_stop_patience: 6
+  log_every: 100
+  output_dir: checkpoints/v10_ft224
