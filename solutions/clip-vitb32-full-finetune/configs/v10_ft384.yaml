@@ -1,0 +1,60 @@
+# V10-D: continue at 384 px (12x12 patch grid). Resolution has been the single
+# biggest lever so far (224 -> 288 gave +3.0 pp on the frozen test evaluation).
+# Initialised from the 288 px best checkpoint. Train split only.
+seed: 20260926
+
+paths:
+  project_root: /root/autodl-tmp/projects/AIC-Robust-CLIP-复赛
+
+data:
+  train_dir: /root/autodl-tmp/data/aic-rematch/train_cache384
+  manifest: artifacts/train_manifest.csv
+  split: artifacts/split_seed20260921.json
+  num_classes: 750
+  expected_train_images: 148643
+  image_size: 384
+  eval_size: 384
+  eval_resize_ratio: 1.14
+  batch_size: 160
+  val_batch_size: 192
+  num_workers: 12
+  prefetch_factor: 3
+
+model:
+  backbone: openai/clip-vit-base-patch32
+  revision: c237dc49a33fc61debc9276459120b7eac67e7ef
+  head: linear
+  dropout: 0.0
+  freeze_patch_embed: false
+
+augment:
+  rrc_scale: [0.50, 1.0]
+  color_jitter: 0.4
+  rand_augment: true
+  rand_augment_ops: 2
+  rand_augment_magnitude: 7
+  random_erase: 0.25
+  mixup: 0.2
+  cutmix: 1.0
+  mix_prob: 0.5
+  label_smoothing: 0.1
+
+sampler:
+  scheme: sqrt_inv
+  power: 0.5
+
+train:
+  epochs: 10
+  lr_backbone: 1.0e-5
+  lr_head: 2.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 0.5
+  min_lr_ratio: 0.02
+  grad_clip: 1.0
+  ema_decay: 0.9995
+  amp_dtype: bfloat16
+  elr_lambda: 0.0
+  elr_momentum: 0.9
+  early_stop_patience: 5
+  log_every: 100
+  output_dir: checkpoints/v10_ft384

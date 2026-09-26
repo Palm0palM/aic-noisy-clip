@@ -1,0 +1,63 @@
+# V10-FINAL2: continued schedule on the full training set (still 448 px, lower LR).
+# Run with --train-on-all so the previous 10% hold-out is also trained on
+# (148,643 images). Recipe = 448 px + the regularised settings that won V10-H.
+# Early stopping is disabled: the hold-out is in-sample here, so the run simply
+# executes the fixed schedule and the last checkpoint is the deliverable.
+seed: 20260926
+
+paths:
+  project_root: /root/autodl-tmp/projects/AIC-Robust-CLIP-复赛
+
+data:
+  train_dir: /root/autodl-tmp/data/aic-rematch/train
+  manifest: artifacts/train_manifest.csv
+  split: artifacts/split_seed20260921.json
+  num_classes: 750
+  expected_train_images: 148643
+  decode_cap: 896
+  image_size: 448
+  eval_size: 448
+  eval_resize_ratio: 1.14
+  batch_size: 128
+  val_batch_size: 160
+  num_workers: 12
+  prefetch_factor: 3
+
+model:
+  backbone: openai/clip-vit-base-patch32
+  revision: c237dc49a33fc61debc9276459120b7eac67e7ef
+  head: linear
+  dropout: 0.15
+  freeze_patch_embed: false
+
+augment:
+  rrc_scale: [0.30, 1.0]
+  color_jitter: 0.5
+  rand_augment: true
+  rand_augment_ops: 2
+  rand_augment_magnitude: 10
+  random_erase: 0.35
+  mixup: 0.2
+  cutmix: 1.0
+  mix_prob: 0.8
+  label_smoothing: 0.15
+
+sampler:
+  scheme: sqrt_inv
+  power: 0.5
+
+train:
+  epochs: 5
+  lr_backbone: 4.0e-6
+  lr_head: 8.0e-5
+  weight_decay: 0.15
+  warmup_epochs: 0.3
+  min_lr_ratio: 0.02
+  grad_clip: 1.0
+  ema_decay: 0.9995
+  amp_dtype: bfloat16
+  elr_lambda: 0.0
+  elr_momentum: 0.9
+  early_stop_patience: 0
+  log_every: 100
+  output_dir: checkpoints/v10_final2
