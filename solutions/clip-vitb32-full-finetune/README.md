@@ -1,6 +1,6 @@
 # AIC 复赛：CLIP ViT-B/32 全参数微调 + 渐进分辨率 + 域随机化
 
-> 冻结后测试集实测（本机用主办方真值独立计算）：**74.77%**（V10-FINAL2，27,998 / 37,444）
+> 冻结后测试集实测（本机用主办方真值独立计算）：**75.28%**（V10-FINAL4，28,186 / 37,444）
 > 全程遵守赛题约束：单一骨干（OpenAI CLIP ViT-B/32）、单一模型、单推理流程，无多模型集成、无外部数据、无其他视觉模型，测试集图像与标签均不参与训练。
 
 ---
@@ -18,7 +18,7 @@
 关键结论：
 
 1. **局部微调不够，要全参数微调**。把可训练参数从"末 2 个 block + LoRA（约 17%）"放开到全部 88.2M，是最大的一步收益。
-2. **分辨率到 384 为止有效**（224 → 288 → 384 分别 +3.05pp、+2.50pp），448 在旧配方下无效，但与强正则叠加后仍有小增益。
+2. **分辨率在强正则配方下到 512 仍在给分**：224 → 288 → 384 → 448 → 512 依次为 67.47 → 70.52 → 73.02 → 73.77 → 75.20，576 只剩 +0.08pp，至此封顶。注意 448 在旧的无正则配方下曾被判定"无效"——说明分辨率是否到顶依赖配方，不能靠单点判断下结论。
 3. **训练内指标会被同源近重复图抬高 4–7pp**，必须用"冻结后测试集一次性评估"做判据，否则会出现"内部涨、线上不涨"。
 4. **测试集类均衡先验基本被 inverse-sqrt 重采样对齐**：在均衡留出切片上扫描类别先验校正，最优即 τ=0。
 
@@ -68,7 +68,9 @@ pred_results.csv / pred_results.zip
 | V10-G | 正则再推一档 | 384 | 133,774 | 73.6006 |
 | V10-H | 448 + 强正则 | 448 | 133,774 | 73.7715 |
 | V10-FINAL | 全量数据 | 448 | **148,643** | 74.6288 |
-| V10-FINAL2 | 全量 + 低 LR 续训 | 448 | 148,643 | **74.7730** |
+| V10-FINAL2 | 全量 + 低 LR 续训 | 448 | 148,643 | 74.7730 |
+| V10-FINAL3 | 提高分辨率 | 512 | 148,643 | 75.1976 |
+| V10-FINAL4 | 提高分辨率 | 576 | 148,643 | **75.2751** |
 
 单点收益最强的三步：全参微调（+3.14pp）、288→384（+2.50pp）、并入留出的 10% 数据（+0.86pp）。
 
@@ -95,11 +97,15 @@ python -m aic_clip.train_ft --config configs/v10_final.yaml --train-on-all \
     --initialize checkpoints/v10_ft448_reg/best.pt
 python -m aic_clip.train_ft --config configs/v10_final2.yaml --train-on-all \
     --initialize checkpoints/v10_final/last.pt
+python -m aic_clip.train_ft --config configs/v10_final3.yaml --train-on-all \
+    --initialize checkpoints/v10_final2/best.pt   # 512 px
+python -m aic_clip.train_ft --config configs/v10_final4.yaml --train-on-all \
+    --initialize checkpoints/v10_final3/best.pt   # 576 px
 
 # 3) 测试集推理（四视图 TTA）→ pred_results.csv + pred_results.zip
-python -m aic_clip.infer_ft --checkpoint checkpoints/v10_final2/best.pt --weights raw \
-  --test-dir data/test --views resize448,center,flip,resize627.2 \
-  --output-dir artifacts/submission_v10_final2
+python -m aic_clip.infer_ft --checkpoint checkpoints/v10_final4/best.pt --weights raw \
+  --test-dir data/test --views resize576,center,flip,resize806.4 \
+  --output-dir artifacts/submission_v10_final4
 ```
 
 诊断脚本（全部只读，且只用训练侧数据）：
