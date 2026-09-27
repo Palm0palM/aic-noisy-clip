@@ -15,6 +15,7 @@ Key ingredients (all standard, all reproducible from this file + config):
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import random
@@ -418,6 +419,7 @@ def main():
                         help="train on the full manifest (train+holdout); holdout metrics then become in-sample and are only logged")
     parser.add_argument("--drop-indices", default="", help="npy with manifest positions to exclude from training")
     parser.add_argument("--snapshot-dir", default="", help="if set, save the raw weights after every epoch (for SWA)")
+    parser.add_argument("--snapshot-keep", type=int, default=5, help="rolling window of epoch snapshots to keep")
     parser.add_argument("--image-size", type=int, default=0, help="override config image size")
     parser.add_argument("--epochs", type=int, default=0, help="override config epochs")
     parser.add_argument("--tag", default="", help="suffix appended to output dir")
@@ -473,6 +475,8 @@ def main():
     decode_cap = int(cfg["data"].get("decode_cap", 0))
     train_ds = ManifestDataset(train_root, train_records, train_tf, decode_cap)
     val_ds = ManifestDataset(train_root, val_records, eval_tf, decode_cap)
+    resolution_schedule = cfg["data"].get("resolution_schedule") or []
+    resolution_schedule = sorted((int(ep), int(sz)) for ep, sz in resolution_schedule)
 
     num_classes = int(cfg["data"]["num_classes"])
     counts = np.bincount([r["label"] for r in train_records], minlength=num_classes).astype(np.float64)
@@ -589,6 +593,29 @@ def main():
     print(f"[setup] train={len(train_records)} val={len(val_records)} steps/epoch={steps_per_epoch}", flush=True)
 
     for epoch in range(start_epoch, int(math.ceil(epochs))):
+        if resolution_schedule:
+            target_size = resolution_schedule[0][1]
+            for start_ep, size in resolution_schedule:
+                if epoch >= start_ep:
+                    target_size = size
+            if target_size != image_size:
+                image_size = target_size
+                eval_size = target_size
+                print(f"[res] epoch {epoch}: switching training resolution to {image_size}px", flush=True)
+                del train_loader
+                gc.collect()
+                train_tf = build_train_transform(image_size, cfg["augment"])
+                train_ds = ManifestDataset(train_root, train_records, train_tf, decode_cap)
+                sampler = WeightedRandomSampler(
+                    torch.as_tensor(sample_weights, dtype=torch.double),
+                    num_samples=len(train_records),
+                    replacement=True,
+                )
+                train_loader = DataLoader(
+                    train_ds, batch_size=int(cfg["data"]["batch_size"]), sampler=sampler, drop_last=True, **loader_kwargs
+                )
+                val_ds = ManifestDataset(train_root, val_records, build_eval_transform(eval_size, float(cfg["data"].get("eval_resize_ratio", 1.14))), decode_cap)
+                val_loader = DataLoader(val_ds, batch_size=int(cfg["data"]["val_batch_size"]), shuffle=False, **loader_kwargs)
         model.train()
         epoch_start = time.time()
         running_loss, running_acc, seen = 0.0, 0.0, 0
@@ -670,12 +697,17 @@ def main():
         }
         torch.save(payload, out_dir / "last.pt")
         if args.snapshot_dir:
+            snapshot_dir = Path(args.snapshot_dir)
             torch.save(
                 {"model": raw_state, "epoch": epoch, "config": cfg,
                  "image_size": image_size, "eval_size": eval_size,
                  "num_classes": num_classes, "backbone": cfg["model"]["backbone"]},
-                Path(args.snapshot_dir) / f"epoch{epoch:02d}.pt",
+                snapshot_dir / f"epoch{epoch:02d}.pt",
             )
+            if args.snapshot_keep > 0:
+                saved = sorted(snapshot_dir.glob("epoch*.pt"))
+                for stale in saved[:-args.snapshot_keep]:
+                    stale.unlink(missing_ok=True)
         if score > best_score:
             best_score = score
             torch.save(payload, out_dir / "best.pt")

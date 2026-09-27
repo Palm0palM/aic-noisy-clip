@@ -143,9 +143,12 @@ python -m aic_clip.train_ft --config configs/v10_final4.yaml --train-on-all \
     --initialize checkpoints/v10_final3/best.pt   # 576 px
 
 # 3) 测试集推理（四视图 TTA）→ pred_results.csv + pred_results.zip
-python -m aic_clip.infer_ft --checkpoint checkpoints/v10_final4/best.pt --weights raw \
+python -m aic_clip.train_ft --config configs/v14_long.yaml --snapshot-dir checkpoints/v14/snapshots --snapshot-keep 6
+
+# 3) 测试集推理（四视图 TTA）→ pred_results.csv + pred_results.zip
+python -m aic_clip.infer_ft --checkpoint checkpoints/v13/last.pt --weights raw \
   --test-dir data/test --views resize576,center,flip,resize806.4 \
-  --output-dir artifacts/submission_v10_final4
+  --output-dir artifacts/submission_v13
 ```
 
 诊断脚本（全部只读，且只用训练侧数据）：
@@ -169,6 +172,7 @@ python scripts/evaluate_prior_correction.py --checkpoint <ckpt> --cache data/tra
 3. **16 核 cgroup 配额**：容器 `nproc` 显示 128，但 cgroup 只给 16 核，`num_workers` 按 12 设置最稳；`decode_cap` 用 Pillow 的 JPEG draft 模式能再省一半解码时间。
 4. **BF16 而非 FP16**：早期 FP16 路径出现过 NaN 梯度，BF16 稳定。
 5. **评测口径**：本方案的所有"测试准确率"都是把预测 CSV 与主办方真值对齐后独立计算的；训练与选模过程中从未使用测试图像或测试标签。
+6. **单次长日程**：`configs/v14_long.yaml` 用 `data.resolution_schedule`（如 `[[0,384],[30,448],[45,576]]`）在一次运行内切换训练分辨率，配合单一 cosine 与 `--snapshot-keep` 滚动保存最近若干轮的权重，避免此前"多段重启 + 反复 warmup"的浪费。
 
 ---
 
