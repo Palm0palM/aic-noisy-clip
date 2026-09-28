@@ -42,6 +42,26 @@ class TestDataset(Dataset):
 
 
 def build_view(name: str, image_size: int):
+    """Build a deterministic view.
+
+    Two forms are accepted:
+      * legacy names: "center", "flip", "multicrop", "resize<X>"
+      * explicit specs: "kind:size:ratio" (kind in center / flip), which is what
+        scripts/dump_view_probs.py dumps for hold-out based recipe selection.
+    """
+    if ":" in name:
+        parts = name.split(":")
+        kind, size = parts[0], int(parts[1])
+        ratio = float(parts[2]) if len(parts) > 2 else 1.14
+        ops = [
+            T.Resize(int(round(size * ratio)), interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(size),
+        ]
+        if kind == "flip":
+            ops.append(T.RandomHorizontalFlip(p=1.0))
+        ops += [T.ToTensor(), T.Normalize(CLIP_MEAN, CLIP_STD)]
+        return T.Compose(ops)
+
     if name == "center":
         return T.Compose(
             [
@@ -123,6 +143,7 @@ def main():
 
     device = torch.device("cuda")
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    # note: view specs may carry their own size; the checkpoint size is the fallback
     cfg = payload["config"]
     num_classes = int(payload["num_classes"])
     image_size = int(payload["image_size"])

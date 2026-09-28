@@ -15,6 +15,7 @@ Key ingredients (all standard, all reproducible from this file + config):
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import random
@@ -222,28 +223,73 @@ class FTClassifier(nn.Module):
 
 
 def build_optimizer(model: FTClassifier, cfg: dict):
+    """Build AdamW groups, optionally with layer-wise LR decay (LLRD).
+
+    With llrd_gamma < 1 the vision-tower layers get lr * gamma^(n_layers - depth),
+    i.e. earlier layers train more slowly. The head always uses lr_head.
+    """
     head_ids = {id(p) for p in model.head.parameters()}
-    decay_bb, nodecay_bb, decay_head, nodecay_head = [], [], [], []
+    wd = float(cfg["weight_decay"])
+    lr_bb = float(cfg["lr_backbone"])
+    gamma = float(cfg.get("llrd_gamma", 1.0))
+    n_layers = len(model.vision.vision_model.encoder.layers) if gamma != 1.0 else 0
+
+    groups: dict[tuple[float, float], list] = {}
+
+    def add(param, lr, weight_decay):
+        key = (round(lr, 12), weight_decay)
+        groups.setdefault(key, []).append(param)
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        target_decay = decay_head if id(param) in head_ids else decay_bb
-        target_nodecay = nodecay_head if id(param) in head_ids else nodecay_bb
-        if param.ndim <= 1 or name.endswith(".bias"):
-            target_nodecay.append(param)
-        else:
-            target_decay.append(param)
-    wd = float(cfg["weight_decay"])
+        no_decay = param.ndim <= 1 or name.endswith(".bias")
+        decay = 0.0 if no_decay else wd
+        if id(param) in head_ids:
+            add(param, float(cfg["lr_head"]), decay)
+            continue
+        lr = lr_bb
+        if gamma != 1.0:
+            depth = None
+            if "encoder.layers." in name:
+                depth = int(name.split("encoder.layers.")[1].split(".")[0])
+            elif "pre_layrnorm" in name or "embeddings" in name:
+                depth = -1
+            if depth is not None:
+                lr = lr_bb * (gamma ** (n_layers - 1 - depth if depth >= 0 else n_layers))
+        add(param, lr, decay)
+
     return torch.optim.AdamW(
-        [
-            {"params": decay_bb, "lr": float(cfg["lr_backbone"]), "weight_decay": wd},
-            {"params": nodecay_bb, "lr": float(cfg["lr_backbone"]), "weight_decay": 0.0},
-            {"params": decay_head, "lr": float(cfg["lr_head"]), "weight_decay": wd},
-            {"params": nodecay_head, "lr": float(cfg["lr_head"]), "weight_decay": 0.0},
-        ],
+        [{"params": params, "lr": lr, "weight_decay": decay} for (lr, decay), params in groups.items()],
         betas=(0.9, 0.999),
         eps=1e-8,
     )
+
+
+def apply_freeze_policy(model: FTClassifier, freeze_first_blocks: int = 0, train_last_blocks: int = 0):
+    """Freeze the patch embedding / early tower blocks, or keep only the last N blocks."""
+    tower = model.vision.vision_model
+    n_layers = len(tower.encoder.layers)
+    if train_last_blocks > 0:
+        keep_from = n_layers - train_last_blocks
+        for name, param in tower.named_parameters():
+            if "encoder.layers." in name:
+                depth = int(name.split("encoder.layers.")[1].split(".")[0])
+                param.requires_grad = depth >= keep_from
+            elif "post_layernorm" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        model.vision.visual_projection.requires_grad = False
+        return
+    if freeze_first_blocks > 0:
+        for param in tower.embeddings.parameters():
+            param.requires_grad = False
+        for name, param in tower.named_parameters():
+            if "encoder.layers." in name:
+                depth = int(name.split("encoder.layers.")[1].split(".")[0])
+                if depth < freeze_first_blocks:
+                    param.requires_grad = False
 
 
 class ModelEMA:
@@ -371,6 +417,9 @@ def main():
     parser.add_argument("--init-weights", default="auto", choices=["auto", "raw", "ema"])
     parser.add_argument("--train-on-all", action="store_true",
                         help="train on the full manifest (train+holdout); holdout metrics then become in-sample and are only logged")
+    parser.add_argument("--drop-indices", default="", help="npy with manifest positions to exclude from training")
+    parser.add_argument("--snapshot-dir", default="", help="if set, save the raw weights after every epoch (for SWA)")
+    parser.add_argument("--snapshot-keep", type=int, default=5, help="rolling window of epoch snapshots to keep")
     parser.add_argument("--image-size", type=int, default=0, help="override config image size")
     parser.add_argument("--epochs", type=int, default=0, help="override config epochs")
     parser.add_argument("--tag", default="", help="suffix appended to output dir")
@@ -405,6 +454,14 @@ def main():
     if args.train_on_all:
         print(f"[data] train_on_all: using {len(records)} samples (holdout metrics are in-sample)", flush=True)
         train_idx = list(range(len(records)))
+    if args.drop_indices:
+        drop = {int(x) for x in np.load(args.drop_indices)}
+        before = len(train_idx)
+        train_idx = [i for i in train_idx if i not in drop]
+        print(f"[data] drop_indices: removed {before - len(train_idx)} samples "
+              f"(keep {len(train_idx)})", flush=True)
+    if args.snapshot_dir:
+        Path(args.snapshot_dir).mkdir(parents=True, exist_ok=True)
 
     image_size = int(cfg["data"]["image_size"])
     eval_size = int(cfg["data"]["eval_size"])
@@ -418,6 +475,8 @@ def main():
     decode_cap = int(cfg["data"].get("decode_cap", 0))
     train_ds = ManifestDataset(train_root, train_records, train_tf, decode_cap)
     val_ds = ManifestDataset(train_root, val_records, eval_tf, decode_cap)
+    resolution_schedule = cfg["data"].get("resolution_schedule") or []
+    resolution_schedule = sorted((int(ep), int(sz)) for ep, sz in resolution_schedule)
 
     num_classes = int(cfg["data"]["num_classes"])
     counts = np.bincount([r["label"] for r in train_records], minlength=num_classes).astype(np.float64)
@@ -460,6 +519,14 @@ def main():
     if cfg["model"].get("freeze_patch_embed", False):
         for param in model.vision.vision_model.embeddings.parameters():
             param.requires_grad = False
+    apply_freeze_policy(
+        model,
+        freeze_first_blocks=int(cfg["model"].get("freeze_first_blocks", 0)),
+        train_last_blocks=int(cfg["model"].get("train_last_blocks", 0)),
+    )
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"[model] trainable {trainable/1e6:.2f}M / {total/1e6:.2f}M ({trainable/total:.1%})", flush=True)
 
     if args.initialize:
         payload = torch.load(args.initialize, map_location="cpu", weights_only=False)
@@ -526,6 +593,29 @@ def main():
     print(f"[setup] train={len(train_records)} val={len(val_records)} steps/epoch={steps_per_epoch}", flush=True)
 
     for epoch in range(start_epoch, int(math.ceil(epochs))):
+        if resolution_schedule:
+            target_size = resolution_schedule[0][1]
+            for start_ep, size in resolution_schedule:
+                if epoch >= start_ep:
+                    target_size = size
+            if target_size != image_size:
+                image_size = target_size
+                eval_size = target_size
+                print(f"[res] epoch {epoch}: switching training resolution to {image_size}px", flush=True)
+                del train_loader
+                gc.collect()
+                train_tf = build_train_transform(image_size, cfg["augment"])
+                train_ds = ManifestDataset(train_root, train_records, train_tf, decode_cap)
+                sampler = WeightedRandomSampler(
+                    torch.as_tensor(sample_weights, dtype=torch.double),
+                    num_samples=len(train_records),
+                    replacement=True,
+                )
+                train_loader = DataLoader(
+                    train_ds, batch_size=int(cfg["data"]["batch_size"]), sampler=sampler, drop_last=True, **loader_kwargs
+                )
+                val_ds = ManifestDataset(train_root, val_records, build_eval_transform(eval_size, float(cfg["data"].get("eval_resize_ratio", 1.14))), decode_cap)
+                val_loader = DataLoader(val_ds, batch_size=int(cfg["data"]["val_batch_size"]), shuffle=False, **loader_kwargs)
         model.train()
         epoch_start = time.time()
         running_loss, running_acc, seen = 0.0, 0.0, 0
@@ -606,6 +696,18 @@ def main():
             "backbone": cfg["model"]["backbone"],
         }
         torch.save(payload, out_dir / "last.pt")
+        if args.snapshot_dir:
+            snapshot_dir = Path(args.snapshot_dir)
+            torch.save(
+                {"model": raw_state, "epoch": epoch, "config": cfg,
+                 "image_size": image_size, "eval_size": eval_size,
+                 "num_classes": num_classes, "backbone": cfg["model"]["backbone"]},
+                snapshot_dir / f"epoch{epoch:02d}.pt",
+            )
+            if args.snapshot_keep > 0:
+                saved = sorted(snapshot_dir.glob("epoch*.pt"))
+                for stale in saved[:-args.snapshot_keep]:
+                    stale.unlink(missing_ok=True)
         if score > best_score:
             best_score = score
             torch.save(payload, out_dir / "best.pt")

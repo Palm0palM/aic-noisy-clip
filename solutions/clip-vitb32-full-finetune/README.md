@@ -1,6 +1,6 @@
 # AIC 复赛：CLIP ViT-B/32 全参数微调 + 渐进分辨率 + 域随机化
 
-> 冻结后测试集实测（本机用主办方真值独立计算）：**74.77%**（V10-FINAL2，27,998 / 37,444）
+> 冻结后测试集实测（本机用主办方真值独立计算）：**76.59%**（V13，28,678 / 37,444）
 > 全程遵守赛题约束：单一骨干（OpenAI CLIP ViT-B/32）、单一模型、单推理流程，无多模型集成、无外部数据、无其他视觉模型，测试集图像与标签均不参与训练。
 
 ---
@@ -18,7 +18,7 @@
 关键结论：
 
 1. **局部微调不够，要全参数微调**。把可训练参数从"末 2 个 block + LoRA（约 17%）"放开到全部 88.2M，是最大的一步收益。
-2. **分辨率到 384 为止有效**（224 → 288 → 384 分别 +3.05pp、+2.50pp），448 在旧配方下无效，但与强正则叠加后仍有小增益。
+2. **分辨率在强正则配方下到 512 仍在给分**：224 → 288 → 384 → 448 → 512 依次为 67.47 → 70.52 → 73.02 → 73.77 → 75.20，576 只剩 +0.08pp，至此封顶。注意 448 在旧的无正则配方下曾被判定"无效"——说明分辨率是否到顶依赖配方，不能靠单点判断下结论。
 3. **训练内指标会被同源近重复图抬高 4–7pp**，必须用"冻结后测试集一次性评估"做判据，否则会出现"内部涨、线上不涨"。
 4. **测试集类均衡先验基本被 inverse-sqrt 重采样对齐**：在均衡留出切片上扫描类别先验校正，最优即 τ=0。
 
@@ -68,9 +68,51 @@ pred_results.csv / pred_results.zip
 | V10-G | 正则再推一档 | 384 | 133,774 | 73.6006 |
 | V10-H | 448 + 强正则 | 448 | 133,774 | 73.7715 |
 | V10-FINAL | 全量数据 | 448 | **148,643** | 74.6288 |
-| V10-FINAL2 | 全量 + 低 LR 续训 | 448 | 148,643 | **74.7730** |
+| V10-FINAL2 | 全量 + 低 LR 续训 | 448 | 148,643 | 74.7730 |
+| V10-FINAL3 | 提高分辨率 | 512 | 148,643 | 75.1976 |
+| V10-FINAL4 | 提高分辨率 | 576 | 148,643 | 75.2751 |
+| V10-FINAL5 | 剔除近重复矛盾标签 + 末 3 轮权重平均(SWA) | 576 | 144,572 | 75.5128 |
+| V12 | 受控消融后修正学习率，重做整条阶梯（384→448→576，20 轮） | 576 | 141,190 | 75.9962 |
+| V13 | V12 权重 + 全量数据续训 5 轮 | 576 | 144,572 | **76.5890** |
+
+### 受控消融（`configs/v11/`）
+
+此前所有改动都是链式续训 + 手动挑参数，无法归因。重建干净验证信号（分层抽出 5%、7,453 张，永不参与训练）后，以统一日程（384px、6 轮、每次只改一个变量）跑六个配置：
+
+| 配置 | 留出集 acc | macro | tail |
+|---|---|---|---|
+| 全参 lr 3e-5 + RA7 | **72.11** | 71.24 | 67.61 |
+| 冻结前 6 层 lr 3e-5 | 72.02 | 71.16 | 67.85 |
+| 全参 lr 3e-5 | 71.92 | 71.06 | 67.40 |
+| 只训后 6 层 lr 3e-5 | 71.66 | 70.81 | 67.35 |
+| 全参 lr 1e-5 | 70.39 | 69.52 | 65.91 |
+| 全参 lr 1e-4 | 68.35 | 67.48 | 63.37 |
+
+学习率是唯一大幅拉开差距的维度；冻结策略与增强强度都在 0.4pp 以内。同一分辨率同一学习率下，384px 从 6 轮加到 10 轮，留出集从 71.92 涨到 74.87（+2.95pp）——训练轮数是被低估最严重的维度。
 
 单点收益最强的三步：全参微调（+3.14pp）、288→384（+2.50pp）、并入留出的 10% 数据（+0.86pp）。
+
+---
+
+## 3.5 训练集清洗与权重平均（V10-FINAL5）
+
+用最终模型在训练集内部做特征最近邻（`scripts/dedup_train_set.py`）：
+
+| 指标 | 数值 |
+|---|---|
+| 有近重复图（相似度 ≥0.97）的样本 | 15,082（10.1%） |
+| 标签互相矛盾的近重复对 | 4,238 对 |
+| 被整簇剔除的样本 | 4,071（2.7%） |
+| 簇内多数投票可改写的 | 78 张（绝大多数是 1:1 平票，无法判定） |
+
+矛盾样本提供自相矛盾的监督信号，整簇剔除（自动、可复现、不使用任何测试信息）后重训 4 轮，再用 `scripts/swa_average.py` 把最后 3 个 epoch 的权重平均成单一文件（SWA，仍是一个模型、一条推理流程）：
+
+| 版本 | 测试分 |
+|---|---|
+| 清洗前（V10-FINAL4） | 75.2751 |
+| 剔除矛盾标签 3 轮 | 75.4086 |
+| 剔除矛盾标签 4 轮 | 75.4807 |
+| 同上 + SWA | **75.5128** |
 
 ---
 
@@ -95,11 +137,18 @@ python -m aic_clip.train_ft --config configs/v10_final.yaml --train-on-all \
     --initialize checkpoints/v10_ft448_reg/best.pt
 python -m aic_clip.train_ft --config configs/v10_final2.yaml --train-on-all \
     --initialize checkpoints/v10_final/last.pt
+python -m aic_clip.train_ft --config configs/v10_final3.yaml --train-on-all \
+    --initialize checkpoints/v10_final2/best.pt   # 512 px
+python -m aic_clip.train_ft --config configs/v10_final4.yaml --train-on-all \
+    --initialize checkpoints/v10_final3/best.pt   # 576 px
 
 # 3) 测试集推理（四视图 TTA）→ pred_results.csv + pred_results.zip
-python -m aic_clip.infer_ft --checkpoint checkpoints/v10_final2/best.pt --weights raw \
-  --test-dir data/test --views resize448,center,flip,resize627.2 \
-  --output-dir artifacts/submission_v10_final2
+python -m aic_clip.train_ft --config configs/v14_long.yaml --snapshot-dir checkpoints/v14/snapshots --snapshot-keep 6
+
+# 3) 测试集推理（四视图 TTA）→ pred_results.csv + pred_results.zip
+python -m aic_clip.infer_ft --checkpoint checkpoints/v13/last.pt --weights raw \
+  --test-dir data/test --views resize576,center,flip,resize806.4 \
+  --output-dir artifacts/submission_v13
 ```
 
 诊断脚本（全部只读，且只用训练侧数据）：
@@ -123,6 +172,7 @@ python scripts/evaluate_prior_correction.py --checkpoint <ckpt> --cache data/tra
 3. **16 核 cgroup 配额**：容器 `nproc` 显示 128，但 cgroup 只给 16 核，`num_workers` 按 12 设置最稳；`decode_cap` 用 Pillow 的 JPEG draft 模式能再省一半解码时间。
 4. **BF16 而非 FP16**：早期 FP16 路径出现过 NaN 梯度，BF16 稳定。
 5. **评测口径**：本方案的所有"测试准确率"都是把预测 CSV 与主办方真值对齐后独立计算的；训练与选模过程中从未使用测试图像或测试标签。
+6. **单次长日程**：`configs/v14_long.yaml` 用 `data.resolution_schedule`（如 `[[0,384],[30,448],[45,576]]`）在一次运行内切换训练分辨率，配合单一 cosine 与 `--snapshot-keep` 滚动保存最近若干轮的权重，避免此前"多段重启 + 反复 warmup"的浪费。
 
 ---
 

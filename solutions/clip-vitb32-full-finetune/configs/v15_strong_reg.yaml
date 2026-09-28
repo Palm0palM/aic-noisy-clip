@@ -1,0 +1,70 @@
+# V15: same path as V13 (V12 weights -> full training set -> 5 epochs @576) but with the
+# stronger regularisation / domain-randomisation regime.
+#
+# Evidence behind this single-variable experiment:
+#   * V14 (55-epoch single cosine) lifted the clean hold-out by +2.08 pp while the frozen
+#     test score went DOWN 0.58 pp -> hold-out measures fit to the training domain.
+#   * Historical pattern: stronger regularisation lowered the hold-out but RAISED the test
+#     score (V10-F: hold-out -0.19, test +0.50). Resolution, data volume, dedup and SWA
+#     are the other levers that transferred.
+# So this run keeps everything about V13 identical except the augmentation strength.
+seed: 20260926
+
+paths:
+  project_root: /root/autodl-tmp/projects/AIC-Robust-CLIP-复赛
+
+data:
+  train_dir: /root/autodl-tmp/data/aic-rematch/train
+  manifest: artifacts/train_manifest.csv
+  split: artifacts/split95_seed20260926.json
+  num_classes: 750
+  expected_train_images: 148643
+  decode_cap: 1152
+  image_size: 576
+  eval_size: 576
+  eval_resize_ratio: 1.14
+  batch_size: 80
+  val_batch_size: 96
+  num_workers: 10
+  prefetch_factor: 3
+
+model:
+  backbone: openai/clip-vit-base-patch32
+  revision: c237dc49a33fc61debc9276459120b7eac67e7ef
+  head: linear
+  dropout: 0.15
+  freeze_first_blocks: 0
+  train_last_blocks: 0
+
+augment:
+  rrc_scale: [0.30, 1.0]
+  color_jitter: 0.5
+  rand_augment: true
+  rand_augment_ops: 2
+  rand_augment_magnitude: 10
+  random_erase: 0.35
+  mixup: 0.2
+  cutmix: 1.0
+  mix_prob: 0.8
+  label_smoothing: 0.15
+
+sampler:
+  scheme: sqrt_inv
+  power: 0.5
+
+train:
+  epochs: 5
+  lr_backbone: 4.0e-6
+  lr_head: 1.2e-4
+  llrd_gamma: 1.0
+  weight_decay: 0.15
+  warmup_epochs: 0.3
+  min_lr_ratio: 0.02
+  grad_clip: 1.0
+  ema_decay: 0.9995
+  amp_dtype: bfloat16
+  elr_lambda: 0.0
+  elr_momentum: 0.9
+  early_stop_patience: 0
+  log_every: 200
+  output_dir: checkpoints/v15
