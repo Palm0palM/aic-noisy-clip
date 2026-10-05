@@ -30,6 +30,8 @@ from PIL import Image, ImageFile, ImageOps
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import torchvision.transforms as T
 
+from .domain import TargetedCorruption, canonicalize
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -72,11 +74,21 @@ def load_image(path: Path, decode_cap: int = 0) -> Image.Image:
 
 
 class ManifestDataset(Dataset):
-    def __init__(self, root: Path, records: list[dict], transform, decode_cap: int = 0):
+    def __init__(
+        self,
+        root: Path,
+        records: list[dict],
+        transform,
+        decode_cap: int = 0,
+        canonical_crop: bool = False,
+        soft_targets=None,
+    ):
         self.root = root
         self.records = records
         self.transform = transform
         self.decode_cap = decode_cap
+        self.canonical_crop = canonical_crop
+        self.soft_targets = soft_targets
 
     def __len__(self) -> int:
         return len(self.records)
@@ -84,7 +96,14 @@ class ManifestDataset(Dataset):
     def __getitem__(self, index: int):
         rec = self.records[index]
         image = load_image(self.root / rec["relative_path"], self.decode_cap)
-        return self.transform(image), rec["label"], index
+        if self.canonical_crop:
+            image = canonicalize(image)
+        tensor = self.transform(image)
+        if self.soft_targets is not None:
+            return tensor, rec["label"], index, torch.from_numpy(
+                np.asarray(self.soft_targets[rec["index"]], dtype=np.float32)
+            )
+        return tensor, rec["label"], index
 
 
 def read_manifest(path: Path) -> list[dict]:
@@ -126,8 +145,32 @@ def load_split(path: Path, records: list[dict]) -> tuple[list[int], list[int]]:
     return train_idx, val_idx
 
 
+class LongSideCap:
+    """Scale an image down so its longest side does not exceed `cap`.
+
+    Test images all have a long side of at most 500 px, so this makes the training
+    images carry the same level of detail while the model input stays whatever it
+    was; smaller images are left untouched and nothing is upscaled.
+    """
+
+    def __init__(self, cap: int):
+        self.cap = int(cap)
+
+    def __call__(self, image):
+        width, height = image.size
+        longest = max(width, height)
+        if longest <= self.cap:
+            return image
+        scale = self.cap / float(longest)
+        return image.resize((max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+                            Image.BICUBIC)
+
+
 def build_train_transform(image_size: int, augment: dict):
-    ops = [
+    ops = []
+    if augment.get("long_side_cap"):
+        ops.append(LongSideCap(int(augment["long_side_cap"])))
+    ops += [
         T.RandomResizedCrop(
             image_size,
             scale=tuple(augment.get("rrc_scale", (0.35, 1.0))),
@@ -147,6 +190,8 @@ def build_train_transform(image_size: int, augment: dict):
                 interpolation=T.InterpolationMode.BICUBIC,
             )
         )
+    if augment.get("targeted_corruption"):
+        ops.append(TargetedCorruption(**augment["targeted_corruption"]))
     ops += [T.ToTensor(), T.Normalize(CLIP_MEAN, CLIP_STD)]
     if float(augment.get("random_erase", 0.25)) > 0:
         ops.append(T.RandomErasing(p=float(augment["random_erase"]), value="random"))
@@ -181,28 +226,117 @@ class CosineHead(nn.Module):
 
 
 class FTClassifier(nn.Module):
-    def __init__(self, backbone: str, revision: str, num_classes: int, head: str = "linear", dropout: float = 0.0):
+    """CLIP vision tower plus a linear head.
+
+    feature="projected" (default) keeps the historical behaviour: the head sees
+    the 512-d cross-modal projection of the pooled token. feature="pooled" feeds
+    the 768-d pooled token itself, which removes the rank bottleneck of the
+    projection for a 750-way classifier (see configs/b2_768.yaml).
+
+    local_readout=True adds a second, attention-pooled read-out of the patch
+    tokens: logits = head(projected CLS) + local_head(attention pool of patches).
+    The local head is zero-initialised, so the model starts exactly at the CLS
+    model and learns whatever extra it can use from the spatial tokens.
+    local_queries > 1 pools with several independent queries and concatenates
+    the results, so the read-out can keep more than one region per image.
+    """
+
+    def __init__(
+        self,
+        backbone: str,
+        revision: str,
+        num_classes: int,
+        head: str = "linear",
+        dropout: float = 0.0,
+        feature: str = "projected",
+        head_dim: int | None = None,
+        local_readout: bool = False,
+        local_queries: int = 1,
+    ):
         super().__init__()
         from transformers import CLIPVisionModelWithProjection
 
         self.vision = CLIPVisionModelWithProjection.from_pretrained(
             backbone, revision=revision, use_safetensors=True
         )
-        dim = int(self.vision.config.projection_dim)
+        self.feature = feature
+        if head_dim:
+            dim = int(head_dim)
+        elif feature == "pooled":
+            dim = int(self.vision.config.hidden_size)
+        else:
+            dim = int(self.vision.config.projection_dim)
         self.dropout = nn.Dropout(dropout)
         if head == "cosine":
             self.head = CosineHead(dim, num_classes)
         else:
             self.head = nn.Linear(dim, num_classes)
+        self.local_readout = bool(local_readout)
+        self.local_queries = max(1, int(local_queries))
+        # inference-time knob: does the branch carry useful signal that training
+        # simply left under-weighted, or is it noise?
+        self.local_scale = 1.0
+        if self.local_readout:
+            hidden = int(self.vision.config.hidden_size)
+            self.local_norm = nn.LayerNorm(hidden)
+            # flat parameter so a single-query and a k-query checkpoint stay
+            # shape-compatible for k=1
+            self.local_query = nn.Parameter(torch.randn(hidden * self.local_queries) * 0.02)
+            self.local_head = nn.Linear(hidden * self.local_queries, num_classes)
+            nn.init.zeros_(self.local_head.weight)
+            nn.init.zeros_(self.local_head.bias)
 
-    def embed(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def encode(self, pixel_values: torch.Tensor):
+        """One pass through the vision tower: (features, patch tokens).
+
+        The CLS path and the local read-out share this single forward; running
+        the tower twice doubles the activation memory and OOMs at 576px.
+        """
         height, width = pixel_values.shape[-2:]
         configured = int(self.vision.config.image_size)
         interpolate = height != configured or width != configured
-        return self.vision(pixel_values=pixel_values, interpolate_pos_encoding=interpolate).image_embeds
+        outputs = self.vision.vision_model(
+            pixel_values=pixel_values, interpolate_pos_encoding=interpolate
+        )
+        pooled = outputs.pooler_output
+        if self.feature == "pooled":
+            features = pooled
+        else:
+            features = self.vision.visual_projection(pooled)
+        return features, outputs.last_hidden_state[:, 1:, :]
+
+    def embed(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.encode(pixel_values)[0]
+
+    def pool_local(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Attention-pool normalised patch tokens with each query, then flatten."""
+        tokens = self.local_norm(tokens)
+        query = self.local_query.view(self.local_queries, -1)
+        scale = tokens.shape[-1] ** -0.5
+        weights = torch.softmax(torch.einsum("bnd,kd->bkn", tokens, query) * scale, dim=-1)
+        pooled = torch.einsum("bkn,bnd->bkd", weights, tokens)
+        return pooled.flatten(1)
+
+    def local_attention(self, pixel_values: torch.Tensor):
+        """Per-query attention over the patch tokens, plus the normalised tokens."""
+        _, tokens = self.encode(pixel_values)
+        tokens = self.local_norm(tokens)
+        query = self.local_query.view(self.local_queries, -1)
+        scale = tokens.shape[-1] ** -0.5
+        weights = torch.softmax(torch.einsum("bnd,kd->bkn", tokens, query) * scale, dim=-1)
+        return weights, tokens
+
+    def embed_local(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Attention-pooled patch tokens (the extra spatial read-out)."""
+        _, tokens = self.encode(pixel_values)
+        return self.pool_local(tokens)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        return self.head(self.dropout(self.embed(pixel_values)))
+        features, tokens = self.encode(pixel_values)
+        logits = self.head(self.dropout(features))
+        if self.local_readout:
+            logits = logits + self.local_scale * self.local_head(self.dropout(self.pool_local(tokens)))
+        return logits
 
     def param_groups(self, lr_backbone: float, lr_head: float, weight_decay: float):
         decay, no_decay = [], []
@@ -221,6 +355,15 @@ class FTClassifier(nn.Module):
     def head_params(self):
         return list(self.head.parameters())
 
+    def head_side_params(self):
+        """Everything that should train at the head learning rate."""
+        params = list(self.head.parameters())
+        if self.local_readout:
+            params += list(self.local_norm.parameters())
+            params += list(self.local_head.parameters())
+            params.append(self.local_query)
+        return params
+
 
 def build_optimizer(model: FTClassifier, cfg: dict):
     """Build AdamW groups, optionally with layer-wise LR decay (LLRD).
@@ -228,7 +371,7 @@ def build_optimizer(model: FTClassifier, cfg: dict):
     With llrd_gamma < 1 the vision-tower layers get lr * gamma^(n_layers - depth),
     i.e. earlier layers train more slowly. The head always uses lr_head.
     """
-    head_ids = {id(p) for p in model.head.parameters()}
+    head_ids = {id(p) for p in model.head_side_params()}
     wd = float(cfg["weight_decay"])
     lr_bb = float(cfg["lr_backbone"])
     gamma = float(cfg.get("llrd_gamma", 1.0))
@@ -266,8 +409,18 @@ def build_optimizer(model: FTClassifier, cfg: dict):
     )
 
 
-def apply_freeze_policy(model: FTClassifier, freeze_first_blocks: int = 0, train_last_blocks: int = 0):
-    """Freeze the patch embedding / early tower blocks, or keep only the last N blocks."""
+def apply_freeze_policy(model: FTClassifier, freeze_first_blocks: int = 0, train_last_blocks: int = 0,
+                        freeze_tower: bool = False):
+    """Freeze the patch embedding / early tower blocks, or keep only the last N blocks.
+
+    freeze_tower freezes the whole image tower including the projection, leaving
+    only the classifier trainable - the linear-probe stage of LP-FT, which gives
+    the head a sensible direction before the tower is unfrozen.
+    """
+    if freeze_tower:
+        for param in model.vision.parameters():
+            param.requires_grad = False
+        return
     tower = model.vision.vision_model
     n_layers = len(tower.encoder.layers)
     if train_last_blocks > 0:
@@ -343,13 +496,114 @@ def apply_mixup_cutmix(images, targets, mixup_alpha, cutmix_alpha, prob, num_cla
     return images, lam * targets + (1.0 - lam) * targets[index], index
 
 
-def soft_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    return -(target * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+def soft_cross_entropy(logits: torch.Tensor, target: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+    per_sample = -(target * F.log_softmax(logits, dim=1)).sum(dim=1)
+    if reduction == "none":
+        return per_sample
+    return per_sample.mean()
+
+
+def generalized_cross_entropy(logits: torch.Tensor, target: torch.Tensor, q: float = 0.7,
+                              reduction: str = "mean") -> torch.Tensor:
+    """GCE (Zhang & Sabuncu 2018), generalised to soft targets.
+
+    p_y is the probability mass the model puts on the (blended) target, so the
+    loss saturates once p_y is large instead of pushing it to 1 - the standard
+    robust-loss behaviour under label noise.
+    """
+    probs = F.softmax(logits, dim=1)
+    p_y = (probs * target).sum(dim=1).clamp(min=1e-6)
+    per_sample = (1.0 - p_y.pow(q)) / q
+    if reduction == "none":
+        return per_sample
+    return per_sample.mean()
 
 
 # --------------------------------------------------------------------------- #
 # evaluation
 # --------------------------------------------------------------------------- #
+@torch.no_grad()
+def enable_gradient_checkpointing(model: nn.Module, last_n: int = 0) -> int:
+    """Recompute the last `last_n` tower layers' activations during backward.
+
+    This transformers build declares `gradient_checkpointing` on CLIPVisionEncoder
+    but never uses it in forward(), so the layer loop is replaced here. The
+    memory saving is what lets the local read-out run at the same batch size as
+    V16 instead of changing the recipe to fit.
+    """
+    from torch.utils.checkpoint import checkpoint
+    from transformers.modeling_outputs import BaseModelOutput
+
+    encoder = model.vision.vision_model.encoder
+    layers = list(encoder.layers)
+    n = len(layers) if last_n <= 0 else min(last_n, len(layers))
+    start = len(layers) - n
+
+    def run_layer(layer, hidden_states, attention_mask, causal_attention_mask):
+        return layer(hidden_states, attention_mask, causal_attention_mask)[0]
+
+    def forward(inputs_embeds, attention_mask=None, causal_attention_mask=None,
+                output_attentions=None, output_hidden_states=None, return_dict=None, **kwargs):
+        hidden_states = inputs_embeds
+        for index, layer in enumerate(layers):
+            if index >= start:
+                hidden_states = checkpoint(
+                    run_layer, layer, hidden_states, attention_mask, causal_attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states = run_layer(layer, hidden_states, attention_mask, causal_attention_mask)
+        return BaseModelOutput(last_hidden_state=hidden_states)
+
+    encoder.forward = forward
+    return n
+
+
+@torch.no_grad()
+def local_branch_report(model: nn.Module, loader: DataLoader, amp_dtype, device, batches: int = 6) -> None:
+    """Check that the local read-out learned something, and that queries differ.
+
+    Prints the mean pairwise cosine similarity between the per-image attention
+    maps of the different queries (a value near 1 means they collapsed onto the
+    same region, so a multi-query result would not test anything), and how large
+    the local logits are relative to the CLS logits.
+    """
+    if not getattr(model, "local_readout", False):
+        return
+    model.eval()
+    maps, local_scale, cls_scale = [], [], []
+    for step, batch in enumerate(loader):
+        if step >= batches:
+            break
+        images = batch[0].to(device, non_blocking=True)
+        weights, _ = model.local_attention(images)
+        flat = weights.float().reshape(weights.shape[0], weights.shape[1], -1)
+        flat = flat - flat.mean(dim=-1, keepdim=True)
+        flat = flat / flat.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        maps.append(flat.cpu())
+        with torch.autocast("cuda", dtype=amp_dtype):
+            cls_logits = model.head(model.embed(images))
+            local_logits = model.local_head(model.embed_local(images))
+        cls_scale.append(cls_logits.float().abs().mean().item())
+        local_scale.append(local_logits.float().abs().mean().item())
+    if not maps:
+        return
+    stacked = torch.cat(maps, dim=0)  # (B, k, N)
+    k = stacked.shape[1]
+    sims = []
+    for i in range(k):
+        for j in range(i + 1, k):
+            sims.append(float((stacked[:, i] * stacked[:, j]).sum(-1).mean()))
+    ratio = float(np.mean(local_scale) / max(np.mean(cls_scale), 1e-6))
+    print(
+        f"[local] queries={k} mean pairwise attention cosine "
+        f"{np.mean(sims) if sims else float('nan'):+.3f} (min {min(sims) if sims else float('nan'):+.3f}), "
+        f"|local logits| / |cls logits| {ratio:.3f}",
+        flush=True,
+    )
+    model.train()
+
+
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, num_classes: int, amp_dtype, device) -> dict:
     model.eval()
@@ -423,6 +677,8 @@ def main():
     parser.add_argument("--image-size", type=int, default=0, help="override config image size")
     parser.add_argument("--epochs", type=int, default=0, help="override config epochs")
     parser.add_argument("--tag", default="", help="suffix appended to output dir")
+    parser.add_argument("--sample-weight-file", default="",
+                        help="npy of per-manifest-row weights (e.g. out-of-fold reliability)")
     args = parser.parse_args()
 
     import yaml
@@ -473,8 +729,17 @@ def main():
     if args.smoke:
         val_records = val_records[:1500]
     decode_cap = int(cfg["data"].get("decode_cap", 0))
-    train_ds = ManifestDataset(train_root, train_records, train_tf, decode_cap)
-    val_ds = ManifestDataset(train_root, val_records, eval_tf, decode_cap)
+    canonical_crop = bool(cfg["data"].get("canonical_crop", False))
+    soft_target_weight = float(cfg["train"].get("soft_target_weight", 0.0))
+    soft_targets = None
+    if soft_target_weight > 0:
+        soft_path = project / cfg["train"]["soft_targets"]
+        soft_targets = np.load(soft_path, mmap_mode="r")
+        if len(soft_targets) != len(records):
+            raise ValueError(f"soft targets {soft_path} have {len(soft_targets)} rows, manifest has {len(records)}")
+        print(f"[soft] distilling from {soft_path} with weight {soft_target_weight}", flush=True)
+    train_ds = ManifestDataset(train_root, train_records, train_tf, decode_cap, canonical_crop, soft_targets)
+    val_ds = ManifestDataset(train_root, val_records, eval_tf, decode_cap, canonical_crop)
     resolution_schedule = cfg["data"].get("resolution_schedule") or []
     resolution_schedule = sorted((int(ep), int(sz)) for ep, sz in resolution_schedule)
 
@@ -514,7 +779,19 @@ def main():
         num_classes,
         head=cfg["model"].get("head", "linear"),
         dropout=float(cfg["model"].get("dropout", 0.0)),
+        feature=cfg["model"].get("feature", "projected"),
+        head_dim=cfg["model"].get("head_dim"),
+        local_readout=bool(cfg["model"].get("local_readout", False)),
+        local_queries=int(cfg["model"].get("local_queries", 1)),
     ).to(device)
+
+    if cfg["model"].get("grad_checkpoint", 0):
+        # 576px at batch 80 already sits at the memory ceiling; the local
+        # read-out needs a few hundred MB more, so recompute tower activations
+        # instead of changing the batch size (which would confound the recipe).
+        last_n = cfg["model"].get("grad_checkpoint_layers", 4)
+        checkpointed = enable_gradient_checkpointing(model, int(last_n))
+        print(f"[model] gradient checkpointing on the last {checkpointed} tower layers", flush=True)
 
     if cfg["model"].get("freeze_patch_embed", False):
         for param in model.vision.vision_model.embeddings.parameters():
@@ -523,6 +800,7 @@ def main():
         model,
         freeze_first_blocks=int(cfg["model"].get("freeze_first_blocks", 0)),
         train_last_blocks=int(cfg["model"].get("train_last_blocks", 0)),
+        freeze_tower=bool(cfg["model"].get("freeze_tower", False)),
     )
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -580,10 +858,43 @@ def main():
         print(f"[resume] from {args.resume} at epoch {start_epoch}", flush=True)
 
     epochs = float(cfg["train"]["epochs"])
+    robust_q = float(cfg["train"].get("robust_loss_q", 0.0))
+    filter_after = int(cfg["train"].get("drop_high_loss_after", -1))
+    filter_rate = float(cfg["train"].get("drop_high_loss_rate", 0.0))
+    # "loss": current behaviour, weight the mixed sample's loss by the anchor
+    # sample's weight. "target": scale each sample's target before mixing, which
+    # is the correct treatment of a mixed pair under per-sample reliabilities.
+    weight_mode = str(cfg["train"].get("sample_weight_mode", "loss"))
+    sample_weight = None
+    loss_tracker = None
+    loss_counter = None
+    if args.sample_weight_file:
+        external = np.load(args.sample_weight_file).astype(np.float32)
+        if len(external) != len(records):
+            raise ValueError(f"weight file has {len(external)} rows, manifest has {len(records)}")
+        # the weight file is in manifest order, but the dataset hands out positions
+        # inside train_records, so it has to be re-indexed here or every weight
+        # lands on the wrong image once any sample has been dropped
+        sample_weight = external[np.asarray(train_idx, dtype=np.int64)]
+        print(f"[weights] external sample weights: min {sample_weight.min():.3f}, "
+              f"mean {sample_weight.mean():.4f}, below 1.0: {int((sample_weight < 1.0).sum())}", flush=True)
+    if filter_after >= 0 and filter_rate > 0:
+        sample_weight = np.ones(len(train_records), dtype=np.float32)
+        loss_tracker = np.zeros(len(train_records), dtype=np.float64)
+        loss_counter = np.zeros(len(train_records), dtype=np.float64)
+        print(f"[noise] high-loss filtering from epoch {filter_after}, dropping "
+              f"{filter_rate:.0%} of the seen samples each round", flush=True)
+    if robust_q > 0:
+        print(f"[noise] robust loss: generalised cross entropy q={robust_q}", flush=True)
     label_smoothing = float(cfg["augment"].get("label_smoothing", 0.1))
     mix_prob = float(cfg["augment"].get("mix_prob", 0.5))
     mixup_alpha = float(cfg["augment"].get("mixup", 0.2))
     cutmix_alpha = float(cfg["augment"].get("cutmix", 1.0))
+    # optional override for the last few epochs: train with strong augmentation
+    # first, then let the final epochs sharpen on less ambiguous targets
+    late_epochs = int(cfg["augment"].get("late_epochs", 0))
+    late_mix_prob = cfg["augment"].get("late_mix_prob", None)
+    late_label_smoothing = cfg["augment"].get("late_label_smoothing", None)
     grad_clip = float(cfg["train"].get("grad_clip", 1.0))
     patience = int(cfg["train"].get("early_stop_patience", 4))
     log_every = int(cfg["train"].get("log_every", 50))
@@ -605,7 +916,7 @@ def main():
                 del train_loader
                 gc.collect()
                 train_tf = build_train_transform(image_size, cfg["augment"])
-                train_ds = ManifestDataset(train_root, train_records, train_tf, decode_cap)
+                train_ds = ManifestDataset(train_root, train_records, train_tf, decode_cap, canonical_crop, soft_targets)
                 sampler = WeightedRandomSampler(
                     torch.as_tensor(sample_weights, dtype=torch.double),
                     num_samples=len(train_records),
@@ -614,23 +925,68 @@ def main():
                 train_loader = DataLoader(
                     train_ds, batch_size=int(cfg["data"]["batch_size"]), sampler=sampler, drop_last=True, **loader_kwargs
                 )
-                val_ds = ManifestDataset(train_root, val_records, build_eval_transform(eval_size, float(cfg["data"].get("eval_resize_ratio", 1.14))), decode_cap)
+                val_ds = ManifestDataset(train_root, val_records, build_eval_transform(eval_size, float(cfg["data"].get("eval_resize_ratio", 1.14))), decode_cap, canonical_crop)
                 val_loader = DataLoader(val_ds, batch_size=int(cfg["data"]["val_batch_size"]), shuffle=False, **loader_kwargs)
+        epoch_mix_prob, epoch_label_smoothing = mix_prob, label_smoothing
+        if late_epochs > 0 and epoch >= int(math.ceil(epochs)) - late_epochs:
+            if late_mix_prob is not None:
+                epoch_mix_prob = float(late_mix_prob)
+            if late_label_smoothing is not None:
+                epoch_label_smoothing = float(late_label_smoothing)
+            print(
+                f"[aug] epoch {epoch}: mix_prob {epoch_mix_prob} label_smoothing {epoch_label_smoothing}",
+                flush=True,
+            )
         model.train()
         epoch_start = time.time()
         running_loss, running_acc, seen = 0.0, 0.0, 0
-        for step, (images, labels, indices) in enumerate(train_loader):
+        for step, batch in enumerate(train_loader):
             if args.smoke and step >= args.smoke:
                 break
+            if soft_targets is None:
+                images, labels, indices = batch
+                teacher = None
+            else:
+                images, labels, indices, teacher = batch
+                teacher = teacher.to(device, non_blocking=True).float()
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            target = one_hot(labels, num_classes, label_smoothing)
+            target = one_hot(labels, num_classes, epoch_label_smoothing)
+            if teacher is not None:
+                target = soft_target_weight * teacher + (1.0 - soft_target_weight) * target
+            batch_weight = None
+            if sample_weight is not None:
+                batch_weight = torch.from_numpy(sample_weight[indices.numpy()]).to(device, non_blocking=True)
+                if weight_mode == "target":
+                    # scale each sample's target by its reliability BEFORE the mix,
+                    # so a mixed pair carries lambda*w_i for image i and (1-lambda)*w_j
+                    # for image j, instead of lumping both under w_i
+                    target = target * batch_weight.unsqueeze(1)
             images, target, _ = apply_mixup_cutmix(
-                images, target, mixup_alpha, cutmix_alpha, mix_prob, num_classes
+                images, target, mixup_alpha, cutmix_alpha, epoch_mix_prob, num_classes
             )
             with torch.autocast("cuda", dtype=amp_dtype):
                 logits = model(images)
-            loss = soft_cross_entropy(logits.float(), target)
+            if robust_q > 0:
+                per_sample = generalized_cross_entropy(logits.float(), target, robust_q, reduction="none")
+            else:
+                per_sample = soft_cross_entropy(logits.float(), target, reduction="none")
+            if batch_weight is None:
+                loss = per_sample.mean()
+            elif weight_mode == "target":
+                loss = per_sample.sum() / target.sum().clamp(min=1.0)
+            else:
+                loss = (per_sample * batch_weight).sum() / batch_weight.sum().clamp(min=1.0)
+            if loss_tracker is not None:
+                with torch.no_grad():
+                    rows = indices.numpy()
+                    values = per_sample.detach().float().cpu().numpy()
+                    if sample_weight is None:
+                        np.add.at(loss_tracker, rows, values)
+                        np.add.at(loss_counter, rows, 1.0)
+                    else:
+                        np.add.at(loss_tracker, rows, values * sample_weight[rows])
+                        np.add.at(loss_counter, rows, sample_weight[rows])
             if elr_lambda > 0:
                 with torch.no_grad():
                     probs = logits.detach().float().softmax(dim=1)
@@ -661,6 +1017,19 @@ def main():
 
         del images, labels, logits, loss
         torch.cuda.empty_cache()
+
+        # high-loss filtering: samples the model has consistently found hard are
+        # the prime suspects for mislabelling, so they stop contributing gradient
+        if loss_tracker is not None and epoch >= filter_after:
+            observed = loss_counter > 0
+            mean_loss = loss_tracker[observed] / np.maximum(loss_counter[observed], 1.0)
+            threshold = float(np.quantile(mean_loss, 1.0 - filter_rate))
+            sample_weight[observed] = (mean_loss <= threshold).astype(np.float32)
+            dropped = int((sample_weight[observed] == 0).sum())
+            print(f"[noise] epoch {epoch}: dropped {dropped} of {int(observed.sum())} seen samples "
+                  f"above loss {threshold:.4f}", flush=True)
+            loss_tracker *= 0.0
+            loss_counter *= 0.0
 
         val_metrics = evaluate(model, val_loader, num_classes, amp_dtype, device)
         raw_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
@@ -694,6 +1063,9 @@ def main():
             "eval_size": eval_size,
             "num_classes": num_classes,
             "backbone": cfg["model"]["backbone"],
+            "feature": cfg["model"].get("feature", "projected"),
+            "local_readout": bool(cfg["model"].get("local_readout", False)),
+            "local_queries": int(cfg["model"].get("local_queries", 1)),
         }
         torch.save(payload, out_dir / "last.pt")
         if args.snapshot_dir:
@@ -721,6 +1093,7 @@ def main():
         if args.smoke:
             break
 
+    local_branch_report(model, train_loader, amp_dtype, device)
     print("[done] best_score=%.4f" % best_score, flush=True)
 
 

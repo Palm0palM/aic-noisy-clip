@@ -1,0 +1,67 @@
+# V31: V16's ladder plus out-of-fold reliability weighting. Only addition: each of
+# the 2,481 images that a fold model confidently and consistently disagreed with
+# (both weak views, same alternative class, margin >= 0.5, not already dropped) is
+# trained at half weight, applied to the target before mixup.
+# V16 stage 2: 448px, 8 epochs (vs 6), LLRD gamma 0.8.
+# V12 ladder: corrected learning rates (the ablation showed 3e-5 >> 1e-5 for backbone lr)
+seed: 20260926
+
+paths:
+  project_root: /root/autodl-tmp/projects/AIC-Robust-CLIP-复赛
+
+data:
+  train_dir: /root/autodl-tmp/data/aic-rematch/train
+  manifest: artifacts/train_manifest.csv
+  split: artifacts/split95_seed20260926.json
+  num_classes: 750
+  expected_train_images: 148643
+  decode_cap: 896
+  image_size: 448
+  eval_size: 448
+  eval_resize_ratio: 1.14
+  batch_size: 96
+  val_batch_size: 128
+  num_workers: 10
+  prefetch_factor: 3
+
+model:
+  backbone: openai/clip-vit-base-patch32
+  revision: c237dc49a33fc61debc9276459120b7eac67e7ef
+  head: linear
+  dropout: 0.0
+  freeze_first_blocks: 0
+  train_last_blocks: 0
+
+augment:
+  rrc_scale: [0.35, 1.0]
+  color_jitter: 0.5
+  rand_augment: true
+  rand_augment_ops: 2
+  rand_augment_magnitude: 7
+  random_erase: 0.3
+  mixup: 0.2
+  cutmix: 1.0
+  mix_prob: 0.8
+  label_smoothing: 0.15
+
+sampler:
+  scheme: sqrt_inv
+  power: 0.5
+
+train:
+  epochs: 8
+  lr_backbone: 1.5e-5
+  lr_head: 3.0e-4
+  llrd_gamma: 0.8
+  weight_decay: 0.15
+  warmup_epochs: 0.5
+  min_lr_ratio: 0.02
+  grad_clip: 1.0
+  ema_decay: 0.9995
+  sample_weight_mode: target
+  amp_dtype: bfloat16
+  elr_lambda: 0.0
+  elr_momentum: 0.9
+  early_stop_patience: 0
+  log_every: 200
+  output_dir: checkpoints/v31/s2_448
