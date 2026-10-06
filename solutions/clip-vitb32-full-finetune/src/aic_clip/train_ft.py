@@ -479,8 +479,9 @@ def rand_bbox(height: int, width: int, lam: float, device):
 
 
 def apply_mixup_cutmix(images, targets, mixup_alpha, cutmix_alpha, prob, num_classes):
+    """Returns (images, targets, index, lam); index/lam are None when not mixed."""
     if prob <= 0 or random.random() > prob:
-        return images, targets, None
+        return images, targets, None, None
     index = torch.randperm(images.size(0), device=images.device)
     if mixup_alpha > 0 and (cutmix_alpha <= 0 or random.random() < 0.5):
         lam = float(np.random.beta(mixup_alpha, mixup_alpha))
@@ -492,8 +493,61 @@ def apply_mixup_cutmix(images, targets, mixup_alpha, cutmix_alpha, prob, num_cla
         images[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
         lam = 1.0 - ((y2 - y1) * (x2 - x1) / (images.size(2) * images.size(3)))
     else:
-        return images, targets, None
-    return images, lam * targets + (1.0 - lam) * targets[index], index
+        return images, targets, None, None
+    return images, lam * targets + (1.0 - lam) * targets[index], index, lam
+
+
+def anchor_penalty(model, anchor_ref, alpha):
+    """L2-SP pull towards the official pretrained weights: (alpha/2)||theta-theta0||^2.
+
+    Only parameters that are still trainable are anchored; the classification
+    head is never anchored (it has no pretrained value). The reference is
+    captured right after the backbone is constructed from the official
+    checkpoint, so alpha = 0 is a strict no-op.
+    """
+    total = None
+    for name, param in model.vision.named_parameters():
+        if not param.requires_grad:
+            continue
+        term = ((param.float() - anchor_ref[name]) ** 2).sum()
+        total = term if total is None else total + term
+    return 0.5 * alpha * total
+
+
+def anchor_drift(model, anchor_ref) -> float:
+    """sqrt(sum ||theta - theta0||^2) over the anchored parameters."""
+    total = 0.0
+    for name, param in model.vision.named_parameters():
+        if not param.requires_grad:
+            continue
+        total += float(((param.detach().float() - anchor_ref[name]) ** 2).sum())
+    return total ** 0.5
+
+
+def elr_regularizer(logits, elr_targets, indices, mix_index, mix_lam, momentum, lam):
+    """ELR penalty (Liu et al. 2020) with a grad-carrying current prediction.
+
+    The buffer holds a per-image EMA of past predictions and is always detached;
+    the penalty is ``lam * mean(log(1 - <p_now, history>))``, so gradients flow
+    only through the current prediction. When the batch was mixed, neither image
+    saw its own pixels, so the buffer is not updated and the comparison target is
+    the same blend of the two histories.
+    """
+    probs_now = logits.float().softmax(dim=1)
+    indices = indices.to(elr_targets.device)
+    with torch.no_grad():
+        if mix_index is None:
+            elr_targets[indices] = (
+                momentum * elr_targets[indices] + (1.0 - momentum) * probs_now.detach()
+            )
+            history = elr_targets[indices]
+        else:
+            history = (
+                mix_lam * elr_targets[indices]
+                + (1.0 - mix_lam) * elr_targets[indices[mix_index]]
+            )
+    dot = (probs_now * history.detach()).sum(dim=1).clamp(max=1.0 - 1e-4)
+    return lam * torch.log(1.0 - dot).mean()
 
 
 def soft_cross_entropy(logits: torch.Tensor, target: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
@@ -785,6 +839,16 @@ def main():
         local_queries=int(cfg["model"].get("local_queries", 1)),
     ).to(device)
 
+    # L2-SP reference: the official pretrained backbone, captured before any
+    # freezing or --initialize load, so "the anchor" always means the official
+    # weights rather than whatever a previous stage happened to end at.
+    anchor_alpha = float(cfg["train"].get("anchor_lambda", 0.0))
+    anchor_ref = None
+    if anchor_alpha > 0:
+        anchor_ref = {name: param.detach().clone() for name, param in model.vision.named_parameters()}
+        print(f"[anchor] L2-SP enabled, alpha={anchor_alpha:g}, "
+              f"{len(anchor_ref)} tensors anchored to the official weights", flush=True)
+
     if cfg["model"].get("grad_checkpoint", 0):
         # 576px at batch 80 already sits at the memory ceiling; the local
         # read-out needs a few hundred MB more, so recompute tower activations
@@ -962,7 +1026,7 @@ def main():
                     # so a mixed pair carries lambda*w_i for image i and (1-lambda)*w_j
                     # for image j, instead of lumping both under w_i
                     target = target * batch_weight.unsqueeze(1)
-            images, target, _ = apply_mixup_cutmix(
+            images, target, mix_index, mix_lam = apply_mixup_cutmix(
                 images, target, mixup_alpha, cutmix_alpha, epoch_mix_prob, num_classes
             )
             with torch.autocast("cuda", dtype=amp_dtype):
@@ -988,17 +1052,17 @@ def main():
                         np.add.at(loss_tracker, rows, values * sample_weight[rows])
                         np.add.at(loss_counter, rows, sample_weight[rows])
             if elr_lambda > 0:
-                with torch.no_grad():
-                    probs = logits.detach().float().softmax(dim=1)
-                    elr_targets[indices] = (
-                        elr_momentum * elr_targets[indices] + (1.0 - elr_momentum) * probs
-                    )
-                    dot = (probs * elr_targets[indices]).sum(dim=1).clamp(max=1.0 - 1e-4)
-                loss = loss + elr_lambda * torch.log(1.0 - dot).mean()
+                loss = loss + elr_regularizer(
+                    logits, elr_targets, indices, mix_index, mix_lam,
+                    elr_momentum, elr_lambda,
+                )
+            if anchor_alpha > 0:
+                loss = loss + anchor_penalty(model, anchor_ref, anchor_alpha)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            grad_norm = None
             if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip))
             optimizer.step()
             scheduler.step()
             ema.update(model)
@@ -1007,11 +1071,16 @@ def main():
             running_acc += float((logits.detach().argmax(1) == labels).float().sum())
             seen += labels.numel()
             if log_every and (step + 1) % log_every == 0:
+                extra = ""
+                if anchor_alpha > 0:
+                    drift = anchor_drift(model, anchor_ref)
+                    extra = (f" anchor_drift {drift:.4f} g_anchor {anchor_alpha * drift:.3e}"
+                             f" g_total {grad_norm if grad_norm is not None else float('nan'):.3e}")
                 print(
                     f"epoch {epoch} step {step + 1}/{steps_per_epoch} "
                     f"loss {running_loss / seen:.4f} acc {running_acc / seen:.4f} "
                     f"lr {optimizer.param_groups[0]['lr']:.3e} "
-                    f"{(time.time() - epoch_start) / (step + 1):.2f}s/step",
+                    f"{(time.time() - epoch_start) / (step + 1):.2f}s/step{extra}",
                     flush=True,
                 )
 

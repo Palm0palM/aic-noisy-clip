@@ -12,7 +12,9 @@ probability space). Test images are only read here, never during training.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import time
 import zipfile
 from pathlib import Path
 
@@ -226,6 +228,8 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--expected-count", type=int, default=37444)
     parser.add_argument("--save-probs", action="store_true")
+    parser.add_argument("--probs-dtype", choices=["float32", "float16"], default="float32",
+                        help="saved per-view probability precision; float32 preserves offline averaging")
     parser.add_argument("--local-scale", type=float, default=1.0,
                         help="multiply the local read-out logits (diagnostic sweep)")
     parser.add_argument("--limit", type=int, default=0,
@@ -233,6 +237,7 @@ def main():
     parser.add_argument("--canonical-crop", action="store_true",
                         help="apply the deterministic border crop first (models trained with it)")
     args = parser.parse_args()
+    started = time.monotonic()
 
     device = torch.device("cuda")
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -298,17 +303,23 @@ def main():
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.write(csv_path, arcname="pred_results.csv")
     if args.save_probs:
-        # float16 keeps the dump small enough to pull off the training machine
+        # Preserve probabilities by default; float16 is an explicit lossy option.
         np.savez_compressed(
             out_dir / "test_view_probs.npz",
             files=np.array(files),
-            **{name: probs.astype(np.float16) for name, probs in view_probs.items()},
+            **{name: probs.astype(args.probs_dtype, copy=False) for name, probs in view_probs.items()},
         )
+        np.save(out_dir / "mean_probs.npy", stacked)
 
     counts = np.bincount(predictions, minlength=num_classes)
     report = {
         "checkpoint": str(args.checkpoint),
         "weights": which,
+        "checkpoint_sha256": hashlib.file_digest(open(args.checkpoint, "rb"), "sha256").hexdigest(),
+        "batch_size": args.batch_size,
+        "amp_dtype": str(amp_dtype),
+        "saved_probs_dtype": args.probs_dtype if args.save_probs else None,
+        "minutes": (time.monotonic() - started) / 60,
         "epoch": payload.get("epoch"),
         "views": list(view_probs),
         "rows": len(files),
