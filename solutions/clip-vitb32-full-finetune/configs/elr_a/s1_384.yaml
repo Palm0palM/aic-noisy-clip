@@ -1,0 +1,70 @@
+# Bounded screening arm for the corrected ELR regulariser (2026-10-06).
+#
+# Identical to configs/v30/oof_a.yaml - same fold-A training list, 384px, 14
+# epochs, same LR/LLRD/augmentation/EMA/seed - with ONE change: the ELR term is
+# now implemented so that its gradient actually reaches the parameters (the old
+# implementation computed it under no_grad() with a detached prediction, so it
+# was a constant and every previous "ELR has no effect" reading tested a no-op).
+#
+# Canonical hyper-parameters from Liu et al. 2020 (lambda 3.0, beta 0.7).
+# Compared out-of-fold on fold B against checkpoints/v30_oof_a.
+seed: 20260926
+
+paths:
+  project_root: /root/autodl-tmp/projects/AIC-Robust-CLIP-复赛
+
+data:
+  train_dir: /root/autodl-tmp/data/aic-rematch/train_cache384
+  manifest: artifacts/train_manifest.csv
+  split: artifacts/split95_seed20260926.json
+  num_classes: 750
+  expected_train_images: 148643
+  decode_cap: 0
+  image_size: 384
+  eval_size: 384
+  eval_resize_ratio: 1.14
+  batch_size: 96
+  val_batch_size: 128
+  num_workers: 10
+  prefetch_factor: 3
+
+model:
+  backbone: openai/clip-vit-base-patch32
+  revision: c237dc49a33fc61debc9276459120b7eac67e7ef
+  head: linear
+  dropout: 0.0
+  freeze_first_blocks: 0
+  train_last_blocks: 0
+
+augment:
+  rrc_scale: [0.35, 1.0]
+  color_jitter: 0.5
+  rand_augment: true
+  rand_augment_ops: 2
+  rand_augment_magnitude: 7
+  random_erase: 0.3
+  mixup: 0.2
+  cutmix: 1.0
+  mix_prob: 0.8
+  label_smoothing: 0.15
+
+sampler:
+  scheme: sqrt_inv
+  power: 0.5
+
+train:
+  epochs: 14
+  lr_backbone: 3.0e-5
+  lr_head: 5.0e-4
+  llrd_gamma: 0.8
+  weight_decay: 0.15
+  warmup_epochs: 1.0
+  min_lr_ratio: 0.02
+  grad_clip: 1.0
+  ema_decay: 0.9995
+  amp_dtype: bfloat16
+  elr_lambda: 3.0
+  elr_momentum: 0.7
+  early_stop_patience: 0
+  log_every: 200
+  output_dir: checkpoints/elr_a

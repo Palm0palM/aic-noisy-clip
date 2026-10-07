@@ -12,33 +12,97 @@ probability space). Test images are only read here, never during training.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import time
 import zipfile
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 
 from .train_ft import CLIP_MEAN, CLIP_STD, FTClassifier, load_image
+from .domain import canonicalize
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 
 
 class TestDataset(Dataset):
-    def __init__(self, root: Path, files: list[str], transform):
+    def __init__(self, root: Path, files: list[str], transform, canonical_crop: bool = False):
         self.root = root
         self.files = files
         self.transform = transform
+        self.canonical_crop = canonical_crop
 
     def __len__(self) -> int:
         return len(self.files)
 
     def __getitem__(self, index: int):
         image = load_image(self.root / self.files[index])
+        if self.canonical_crop:
+            image = canonicalize(image)
         return self.transform(image), index
+
+
+ANCHOR_FRACTIONS = {
+    "tl": (0.0, 0.0),
+    "tc": (0.5, 0.0),
+    "tr": (1.0, 0.0),
+    "ml": (0.0, 0.5),
+    "mc": (0.5, 0.5),
+    "mr": (1.0, 0.5),
+    "bl": (0.0, 1.0),
+    "bc": (0.5, 1.0),
+    "br": (1.0, 1.0),
+}
+
+
+class AnchorCrop:
+    """Crop a size x size window placed at a relative anchor in the image.
+
+    The image is first resized so its shorter side is `size`, so corners and
+    edge anchors slide the window along the longer side - exactly the content a
+    plain centre crop throws away.
+    """
+
+    def __init__(self, size: int, fx: float, fy: float):
+        self.size = size
+        self.fx = fx
+        self.fy = fy
+
+    def __call__(self, image):
+        width, height = image.size
+        left = int(round((width - self.size) * self.fx))
+        top = int(round((height - self.size) * self.fy))
+        return image.crop((left, top, left + self.size, top + self.size))
+
+
+class FitPad:
+    """Scale the whole image inside a size x size square, padding the rest."""
+
+    def __init__(self, size: int, mode: str):
+        self.size = size
+        self.mode = mode
+
+    def __call__(self, image):
+        width, height = image.size
+        scale = self.size / float(max(width, height))
+        new_w = max(1, int(round(width * scale)))
+        new_h = max(1, int(round(height * scale)))
+        image = image.resize((new_w, new_h), Image.BICUBIC)
+        pad_l = (self.size - new_w) // 2
+        pad_t = (self.size - new_h) // 2
+        pad_r = self.size - new_w - pad_l
+        pad_b = self.size - new_h - pad_t
+        pad = (pad_l, pad_t, pad_r, pad_b)
+        if self.mode == "edge":
+            return TF.pad(image, pad, padding_mode="edge")
+        return TF.pad(image, pad, fill=128)
 
 
 def build_view(name: str, image_size: int):
@@ -46,13 +110,38 @@ def build_view(name: str, image_size: int):
 
     Two forms are accepted:
       * legacy names: "center", "flip", "multicrop", "resize<X>"
-      * explicit specs: "kind:size:ratio" (kind in center / flip), which is what
-        scripts/dump_view_probs.py dumps for hold-out based recipe selection.
+      * explicit specs: "kind:size:ratio", where kind is
+          - center / flip: resize the shorter side to size*ratio, centre crop
+          - an anchor (tl tc tr ml mc mr bl bc br): resize the shorter side to
+            size*ratio, then crop a size x size window at that anchor
+          - fullpad_edge / fullpad_gray: fit the entire image inside the square
+            and pad the remainder
     """
     if ":" in name:
         parts = name.split(":")
         kind, size = parts[0], int(parts[1])
         ratio = float(parts[2]) if len(parts) > 2 else 1.14
+        if kind in ANCHOR_FRACTIONS or (kind.endswith("_flip") and kind[:-5] in ANCHOR_FRACTIONS):
+            flipped = kind.endswith("_flip")
+            anchor = kind[:-5] if flipped else kind
+            fx, fy = ANCHOR_FRACTIONS[anchor]
+            ops = [
+                T.Resize(int(round(size * ratio)), interpolation=T.InterpolationMode.BICUBIC),
+                AnchorCrop(size, fx, fy),
+            ]
+            if flipped:
+                ops.append(T.RandomHorizontalFlip(p=1.0))
+            ops += [T.ToTensor(), T.Normalize(CLIP_MEAN, CLIP_STD)]
+            return T.Compose(ops)
+        if kind.startswith("fullpad"):
+            mode = kind.split("_", 1)[1] if "_" in kind else "edge"
+            return T.Compose(
+                [
+                    FitPad(size, mode),
+                    T.ToTensor(),
+                    T.Normalize(CLIP_MEAN, CLIP_STD),
+                ]
+            )
         ops = [
             T.Resize(int(round(size * ratio)), interpolation=T.InterpolationMode.BICUBIC),
             T.CenterCrop(size),
@@ -103,9 +192,9 @@ def build_view(name: str, image_size: int):
 
 
 @torch.no_grad()
-def run_view(model, root: Path, files: list[str], transform, batch_size: int, workers: int, device, amp_dtype, num_classes: int):
+def run_view(model, root: Path, files: list[str], transform, batch_size: int, workers: int, device, amp_dtype, num_classes: int, canonical_crop: bool = False):
     loader = DataLoader(
-        TestDataset(root, files, transform),
+        TestDataset(root, files, transform, canonical_crop),
         batch_size=batch_size,
         shuffle=False,
         num_workers=workers,
@@ -139,7 +228,16 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--expected-count", type=int, default=37444)
     parser.add_argument("--save-probs", action="store_true")
+    parser.add_argument("--probs-dtype", choices=["float32", "float16"], default="float32",
+                        help="saved per-view probability precision; float32 preserves offline averaging")
+    parser.add_argument("--local-scale", type=float, default=1.0,
+                        help="multiply the local read-out logits (diagnostic sweep)")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="only the first N test files (cheap diagnostic runs)")
+    parser.add_argument("--canonical-crop", action="store_true",
+                        help="apply the deterministic border crop first (models trained with it)")
     args = parser.parse_args()
+    started = time.monotonic()
 
     device = torch.device("cuda")
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -161,13 +259,21 @@ def main():
         num_classes,
         head=cfg["model"].get("head", "linear"),
         dropout=0.0,
+        feature=payload.get("feature", cfg["model"].get("feature", "projected")),
+        head_dim=int(payload.get("head_dim", 0)) or None,
+        local_readout=bool(payload.get("local_readout", cfg["model"].get("local_readout", False))),
+        local_queries=int(payload.get("local_queries", cfg["model"].get("local_queries", 1))),
     ).to(device)
     model.load_state_dict(state, strict=True)
+    if hasattr(model, "local_scale"):
+        model.local_scale = float(args.local_scale)
     model.eval()
 
     root = Path(args.test_dir)
     files = sorted(p.name for p in root.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
-    if args.expected_count and len(files) != args.expected_count:
+    if args.limit:
+        files = files[: args.limit]
+    if args.expected_count and not args.limit and len(files) != args.expected_count:
         raise ValueError(f"found {len(files)} test images, expected {args.expected_count}")
     print(f"[infer] {len(files)} test images")
 
@@ -178,7 +284,8 @@ def main():
         if not name:
             continue
         probs = run_view(
-            model, root, files, build_view(name, image_size), args.batch_size, args.workers, device, amp_dtype, num_classes
+            model, root, files, build_view(name, image_size), args.batch_size, args.workers, device, amp_dtype,
+            num_classes, args.canonical_crop,
         )
         view_probs[name] = probs
         print(f"[infer] view {name}: done, mean max prob {probs.max(1).mean():.4f}", flush=True)
@@ -196,12 +303,23 @@ def main():
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.write(csv_path, arcname="pred_results.csv")
     if args.save_probs:
-        np.savez_compressed(out_dir / "test_view_probs.npz", files=np.array(files), **view_probs)
+        # Preserve probabilities by default; float16 is an explicit lossy option.
+        np.savez_compressed(
+            out_dir / "test_view_probs.npz",
+            files=np.array(files),
+            **{name: probs.astype(args.probs_dtype, copy=False) for name, probs in view_probs.items()},
+        )
+        np.save(out_dir / "mean_probs.npy", stacked)
 
     counts = np.bincount(predictions, minlength=num_classes)
     report = {
         "checkpoint": str(args.checkpoint),
         "weights": which,
+        "checkpoint_sha256": hashlib.file_digest(open(args.checkpoint, "rb"), "sha256").hexdigest(),
+        "batch_size": args.batch_size,
+        "amp_dtype": str(amp_dtype),
+        "saved_probs_dtype": args.probs_dtype if args.save_probs else None,
+        "minutes": (time.monotonic() - started) / 60,
         "epoch": payload.get("epoch"),
         "views": list(view_probs),
         "rows": len(files),

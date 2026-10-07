@@ -1,0 +1,72 @@
+# V35 screening: the mild-augmentation candidate, trained on fold A only at 384px for
+# 14 epochs - identical to the fold-A out-of-fold teacher except for the
+# augmentation: RRC lower bound 0.6 instead of 0.35, CutMix and random erasing
+# switched off, mixing probability 0.3 instead of 0.8. Screening, not a full ladder.
+# V30 OOF model a: 384px, 14 epochs, trained on fold a only (the other fold is dropped),
+# so its predictions on the held-out fold are genuinely out-of-fold. Everything else
+# matches V16 stage 1. These models only produce training-data reliability signal;
+# the final submission still uses one model trained on everything.
+# Two evidence-backed changes over the V12/V13 ladder: the proxy showed that more epochs
+# at a fixed resolution keep paying (B0 10ep -> +20ep: IID +1.39pp, OOD +0.94pp), and that
+# layer-wise LR decay improved the shifted-domain proxy more than any other single change.
+# V12 ladder: corrected learning rates (the ablation showed 3e-5 >> 1e-5 for backbone lr)
+seed: 20260926
+
+paths:
+  project_root: /root/autodl-tmp/projects/AIC-Robust-CLIP-复赛
+
+data:
+  train_dir: /root/autodl-tmp/data/aic-rematch/train_cache384
+  manifest: artifacts/train_manifest.csv
+  split: artifacts/split95_seed20260926.json
+  num_classes: 750
+  expected_train_images: 148643
+  decode_cap: 0
+  image_size: 384
+  eval_size: 384
+  eval_resize_ratio: 1.14
+  batch_size: 96
+  val_batch_size: 128
+  num_workers: 10
+  prefetch_factor: 3
+
+model:
+  backbone: openai/clip-vit-base-patch32
+  revision: c237dc49a33fc61debc9276459120b7eac67e7ef
+  head: linear
+  dropout: 0.0
+  freeze_first_blocks: 0
+  train_last_blocks: 0
+
+augment:
+  rrc_scale: [0.6, 1.0]
+  color_jitter: 0.5
+  rand_augment: true
+  rand_augment_ops: 2
+  rand_augment_magnitude: 7
+  random_erase: 0.0
+  mixup: 0.2
+  cutmix: 0.0
+  mix_prob: 0.3
+  label_smoothing: 0.15
+
+sampler:
+  scheme: sqrt_inv
+  power: 0.5
+
+train:
+  epochs: 14
+  lr_backbone: 3.0e-5
+  lr_head: 5.0e-4
+  llrd_gamma: 0.8
+  weight_decay: 0.15
+  warmup_epochs: 1.0
+  min_lr_ratio: 0.02
+  grad_clip: 1.0
+  ema_decay: 0.9995
+  amp_dtype: bfloat16
+  elr_lambda: 0.0
+  elr_momentum: 0.9
+  early_stop_patience: 0
+  log_every: 200
+  output_dir: checkpoints/v35_mildaub
