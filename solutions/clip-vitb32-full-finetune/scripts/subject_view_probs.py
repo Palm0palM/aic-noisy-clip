@@ -96,6 +96,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--test-dir", required=True)
+    parser.add_argument("--files-json", default="")
     parser.add_argument("--weights", default="ema", choices=["auto", "raw", "ema"])
     parser.add_argument("--size", type=int, default=512)
     parser.add_argument("--tau", type=float, default=0.6)
@@ -121,7 +122,8 @@ def main() -> None:
         raise SystemExit("Refusing to overwrite existing subject probabilities; use a new output directory")
 
     root = Path(args.test_dir)
-    files = sorted(p.name for p in root.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
+    files = (json.loads(Path(args.files_json).read_text())["files"] if args.files_json else
+             sorted(p.name for p in root.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS))
     if args.limit:
         files = files[: args.limit]
     print(f"[subject-test] {len(files)} images", flush=True)
